@@ -1,0 +1,247 @@
+MSC OPEN RESEARCH LICENSE (MSC-ORL)
+Version 1.0 — Marzo 2026
+
+Copyright (c) 2026 Raul Cruz Acosta ("Esraderey")
+MSC Tecnología / Eco Eternal Inversiones
+Puebla, México — https://github.com/esraderey
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+PREÁMBULO
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Esta licencia cubre el software, código fuente, arquitecturas,
+especificaciones matemáticas, documentación y cualquier obra
+derivada del ecosistema MSC Framework, incluyendo sin
+limitación: RecurrentIndependentMechanisms (RIMs v5.0),
+GlobalWorkspaceEA1V2, AttentionSchema, NCO, NeuromodulationSystem,
+EntityBrainV4, MNEME, VENT, CAMV, MSC Star, TREC-BAC y todos
+sus sub-proyectos asociados (en conjunto, "el Software").
+
+El objetivo de esta licencia es maximizar el acceso académico y
+de investigación al Software, mientras el autor conserva control
+explícito sobre cualquier uso que genere valor económico directo
+o indirecto.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARTÍCULO 1 — USOS PERMITIDOS SIN RESTRICCIÓN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Se concede, de forma gratuita, permiso irrevocable para:
+
+  a) Uso personal y educativo: ejecutar, estudiar y modificar
+     el Software para fines de aprendizaje propio, trabajos
+     académicos, tesis, cursos y talleres sin fines de lucro.
+
+  b) Investigación académica: publicar resultados, comparativas,
+     benchmarks y trabajos científicos que utilicen o citen el
+     Software, siempre que se incluya la atribución requerida
+     en el Artículo 5.
+
+  c) Proyectos de código abierto: integrar el Software en obras
+     distribuidas íntegramente bajo licencias de código abierto
+     aprobadas por OSI (MIT, Apache-2.0, GPL, etc.), siempre
+     que el Software conserve esta licencia y la atribución.
+
+  d) Prototipado y evaluación interna: instalar y probar el
+     Software dentro de una organización sin ponerlo en
+     producción ni ofrecerlo a terceros.
+
+  e) Contribuciones al proyecto original: enviar mejoras,
+     correcciones y extensiones al repositorio oficial del autor.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARTÍCULO 2 — USOS QUE REQUIEREN AUTORIZACIÓN PREVIA ESCRITA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Los siguientes usos están EXPRESAMENTE PROHIBIDOS sin haber
+obtenido autorización escrita del autor ANTES de iniciarlos:
+
+  2.1  USO COMERCIAL DIRECTO
+       Cualquier despliegue del Software —o de obras derivadas—
+       en productos, servicios, APIs, plataformas o sistemas
+       que generen ingresos, suscripciones, tarifas de uso,
+       publicidad o cualquier contraprestación económica.
+
+  2.2  INTEGRACIÓN EN SISTEMAS PROPIETARIOS
+       Incorporar el Software, total o parcialmente, en software
+       privativo o de código cerrado, independientemente de si
+       ese software se distribuye o se mantiene interno.
+
+  2.3  OFERTA COMO SERVICIO (SaaS / MLaaS / API-as-a-Service)
+       Poner el Software o sus capacidades a disposición de
+       terceros a través de una interfaz de red, incluso de
+       forma gratuita, si la plataforma que lo aloja tiene
+       modelo comercial o recibe financiación externa.
+
+  2.4  SUBLICENCIAMIENTO Y REDISTRIBUCIÓN COMERCIAL
+       Vender, alquilar, sublicenciar, ceder o transferir el
+       Software o derechos sobre él a terceros con fines
+       lucrativos.
+
+  2.5  ENTRENAMIENTO Y DESTILACIÓN DE MODELOS COMERCIALES
+       Usar el Software, su código, arquitectura o salidas para
+       entrenar, ajustar fino (fine-tuning), destilar o
+       evaluar modelos de inteligencia artificial destinados
+       a uso comercial propio o de terceros.
+
+  2.6  USO GUBERNAMENTAL E INSTITUCIONAL CON PRESUPUESTO
+       Despliegue por parte de entidades gubernamentales,
+       militares, organismos supranacionales o instituciones
+       con presupuesto público, cuando el uso esté vinculado
+       a contratos, licitaciones o proyectos remunerados.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARTÍCULO 3 — PROCESO DE SOLICITUD DE AUTORIZACIÓN COMERCIAL
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+3.1  NOTIFICACIÓN OBLIGATORIA
+     Cualquier persona o entidad que desee realizar un uso
+     comprendido en el Artículo 2 DEBE notificar al autor
+     con un mínimo de 30 días naturales de antelación al
+     inicio del uso.
+
+3.2  CONTENIDO DE LA SOLICITUD
+     La solicitud debe enviarse por escrito (correo electrónico
+     o canal oficial del repositorio) e incluir:
+
+       i.   Nombre completo y razón social del solicitante.
+       ii.  Descripción detallada del uso previsto.
+       iii. Módulos o componentes del Software que se utilizarán.
+       iv.  Modelo de negocio o fuente de ingresos asociada.
+       v.   Fecha de inicio estimada del uso comercial.
+       vi.  Estimación del volumen de uso (usuarios, llamadas/mes, etc.).
+
+3.3  PLAZO DE RESPUESTA
+     El autor responderá en un plazo máximo de 30 días naturales.
+     El silencio NO implica autorización.
+
+3.4  TÉRMINOS DEL ACUERDO
+     La autorización, si se concede, puede incluir:
+       - Regalías o cuota de licencia (a negociar caso por caso).
+       - Restricciones de uso, territoriales o temporales.
+       - Obligación de atribución prominente en el producto.
+       - Participación en el ecosistema MSC Framework.
+     La autorización se formalizará mediante contrato escrito
+     firmado por ambas partes.
+
+3.5  CONTACTO
+     Repositorio oficial: https://github.com/esraderey
+     (Abrir un issue con la etiqueta "commercial-license-request"
+     o enviar mensaje directo al maintainer.)
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARTÍCULO 4 — RESTRICCIONES ABSOLUTAS (NO NEGOCIABLES)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Con independencia de cualquier autorización, queda terminantemente
+prohibido bajo esta licencia:
+
+  a) Eliminar, ocultar o alterar avisos de copyright, créditos
+     de autoría o referencias a esta licencia en cualquier
+     copia o obra derivada.
+
+  b) Usar el nombre "MSC Framework", "Esraderey", "MSC Tecnología",
+     "Eco Eternal Inversiones", "TREC-BAC", "E-α" o cualquier
+     marca asociada al proyecto para promocionar obras derivadas
+     sin autorización expresa.
+
+  c) Reivindicar autoría original sobre el Software o sus
+     arquitecturas, incluso en obras modificadas extensamente.
+
+  d) Usar el Software en sistemas de vigilancia masiva,
+     reconocimiento facial no consentido, armas autónomas,
+     desinformación automatizada o cualquier aplicación que
+     viole derechos humanos fundamentales. Esta restricción
+     no es negociable bajo ninguna circunstancia.
+
+  e) Aplicar medidas tecnológicas o legales (DRM, patentes,
+     NDA unilaterales) que restrinjan a terceros el ejercicio
+     de los derechos que esta licencia les concede.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARTÍCULO 5 — ATRIBUCIÓN REQUERIDA
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Todo uso permitido bajo esta licencia debe incluir la siguiente
+atribución en la documentación, interfaz, publicación o código:
+
+  "Basado en RIMs v5.0 / MSC Framework
+   © 2026 Raul Cruz Acosta (Esraderey)
+   Licenciado bajo MSC-ORL v1.0
+   https://github.com/esraderey"
+
+En publicaciones académicas se debe citar adicionalmente como:
+
+  Cruz Acosta, R. (2026). Recurrent Independent Mechanisms v5.0:
+  MSC Framework Consciousness Architecture Stack.
+  MSC Tecnología / Eco Eternal Inversiones. Puebla, México.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARTÍCULO 6 — OBRAS DERIVADAS
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+6.1  Las obras derivadas distribuidas públicamente deben
+     adoptar esta misma licencia (MSC-ORL v1.0) o una versión
+     posterior publicada por el autor, y deben indicar
+     claramente las modificaciones realizadas.
+
+6.2  No se pueden otorgar permisos adicionales sobre obras
+     derivadas que excedan los concedidos en esta licencia.
+
+6.3  El autor se reserva el derecho de incorporar contribuciones
+     externas al repositorio oficial bajo los términos que
+     considere apropiados, incluyendo la posibilidad de
+     relicenciar el Software en versiones futuras.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARTÍCULO 7 — EXENCIÓN DE GARANTÍAS Y LIMITACIÓN DE RESPONSABILIDAD
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+EL SOFTWARE SE PROPORCIONA "TAL CUAL", SIN GARANTÍA DE NINGÚN
+TIPO, EXPRESA O IMPLÍCITA, INCLUYENDO, SIN LIMITACIÓN, LAS
+GARANTÍAS DE COMERCIABILIDAD, IDONEIDAD PARA UN PROPÓSITO
+PARTICULAR Y NO INFRACCIÓN.
+
+EN NINGÚN CASO EL AUTOR SERÁ RESPONSABLE DE DAÑOS DIRECTOS,
+INDIRECTOS, INCIDENTALES, ESPECIALES, EJEMPLARES O CONSECUENTES
+(INCLUYENDO, SIN LIMITACIÓN, PÉRDIDA DE DATOS, BENEFICIOS O
+INTERRUPCIÓN DEL NEGOCIO) DERIVADOS DEL USO O LA IMPOSIBILIDAD
+DE USO DEL SOFTWARE, INCLUSO SI SE HA ADVERTIDO DE LA
+POSIBILIDAD DE TALES DAÑOS.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARTÍCULO 8 — TERMINACIÓN
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+8.1  Esta licencia se rescinde automáticamente si el licenciatario
+     incumple cualquiera de sus términos.
+
+8.2  Tras la terminación, el licenciatario debe cesar todo uso
+     del Software y destruir todas las copias en su posesión
+     dentro de los 30 días siguientes.
+
+8.3  El incumplimiento del Artículo 2 sin autorización previa
+     faculta al autor a reclamar daños y perjuicios equivalentes
+     al mayor de: (i) los beneficios obtenidos por el infractor,
+     o (ii) una tarifa de licencia razonable de mercado para
+     el uso realizado, más los costos legales.
+
+8.4  Los Artículos 4, 5, 7 y 8.3 sobreviven a la terminación
+     de esta licencia.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+ARTÍCULO 9 — LEY APLICABLE
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Esta licencia se rige por las leyes de los Estados Unidos
+Mexicanos. Cualquier disputa se someterá a la jurisdicción
+de los tribunales competentes de la Ciudad de Puebla de Zaragoza,
+Puebla, México, renunciando expresamente a cualquier otro fuero.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+FIN DE LA LICENCIA MSC-ORL v1.0
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+Para preguntas sobre esta licencia o para solicitar una
+autorización comercial, contacta a través del repositorio
+oficial: https://github.com/esraderey
