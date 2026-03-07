@@ -1,4 +1,10 @@
 """
+# SPDX-License-Identifier: MSC-ORL-1.0
+# Copyright (c) 2026 Raul Cruz Acosta (Esraderey) — MSC Tecnología
+# Licensed under MSC Open Research License v1.0
+# Free for research/education. Commercial use requires written authorization.
+# See LICENSE.txt 
+
 Recurrent Independent Mechanisms (RIMs) – Implementacion Completa.
 
 Implementa fielmente las formulaciones matematicas y variantes modernas
