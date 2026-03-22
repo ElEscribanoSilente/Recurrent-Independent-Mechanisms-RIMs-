@@ -95,22 +95,73 @@ x_t ──► InputAttentionRIM ──► scores [B, K]
 
 ## Instalación
 
-```bash
-# Dentro del entorno MSC
-pip install torch>=2.0  # único requisito externo
+### Desde el repositorio MSC
 
-# Copiar al paquete de consciencia
-cp rims.py src/consciousness/layers/rims.py
+```bash
+pip install msc-rims
 ```
 
-El módulo asume la existencia de `.base.ConsciousnessLayerBase` y `.config.LayerConfig` del stack MSC. Para uso standalone, hereda de `nn.Module` directamente.
+O directamente desde source:
+
+```bash
+git clone https://github.com/msc-tecnologia/msc-rims.git
+cd msc-rims
+pip install -e .
+```
+
+### Dependencias
+
+| Paquete | Versión mínima | Notas |
+|---------|---------------|-------|
+| `torch` | ≥ 2.0 | Único requisito hard. CUDA opcional pero recomendado |
+
+### Estructura del paquete
+
+```
+msc-rims/
+├── msc_rims/
+│   ├── __init__.py
+│   ├── rims.py                # Módulo principal (RecurrentIndependentMechanisms)
+│   ├── base.py                # ConsciousnessLayerBase
+│   └── config.py              # LayerConfig
+├── tests/
+│   └── tests_rims.py          # 30 tests (v5.1)
+├── benchmarks/
+│   └── benchmarks.py
+├── pyproject.toml
+├── LICENSE.txt                # MSC-ORL-1.0
+├── CHANGELOG.md
+└── README.md
+```
+
+### Uso standalone (sin stack MSC)
+
+El módulo es completamente independiente. `ConsciousnessLayerBase` y `LayerConfig` se incluyen en el paquete como dependencias internas ligeras — no requieren el resto del framework MSC.
+
+```python
+from msc_rims import RecurrentIndependentMechanisms, RIMsState
+
+rims = RecurrentIndependentMechanisms(input_size=128, hidden_size=384)
+```
+
+### Como capa dentro del stack MSC
+
+Si se integra al ecosistema completo de consciencia (E-α-1-v3, GlobalWorkspaceEA1V2, etc.), registrar como layer:
+
+```python
+# En consciousness/layers/__init__.py
+from msc_rims import RecurrentIndependentMechanisms
+```
+
+La integración con `EntityBrainV4` y el `NCO` se documenta en [§Integración con MSC](#integración-con-msc).
 
 ---
 
 ## Uso rápido
 
 ```python
-from consciousness.layers.rims import RecurrentIndependentMechanisms
+import torch
+from msc_rims import RecurrentIndependentMechanisms
 
 # Configuración mínima
 rims = RecurrentIndependentMechanisms(
@@ -409,7 +460,7 @@ Cobertura: 30 tests (22 originales + 8 nuevos v5.1):
 
 ```python
 # En EntityBrainV4 / GlobalWorkspaceEA1V2
-from consciousness.layers.rims import RecurrentIndependentMechanisms
+from msc_rims import RecurrentIndependentMechanisms
 
 self.rims = RecurrentIndependentMechanisms(
     input_size       = self.perception_dim,
