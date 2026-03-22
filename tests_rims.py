@@ -1,16 +1,18 @@
 """
-Tests unitarios y de integracion para RIMs v5.0.
+Tests unitarios y de integracion para RIMs v5.1.
 
-Cobertura:
+Cobertura (30 tests):
   - GroupGRUCell: shapes, gradientes, independencia entre grupos
-  - _InputAttentionRIM: shapes, scores, mascara top-k
-  - _MultiHeadCommResidual: residual, inactivos congelados
-  - _GlobalWorkspace: ciclo write/broadcast, shapes
-  - _DVNCCodebook: cuantizacion, vq_loss, straight-through gradiente
+  - _InputAttentionRIM: shapes, scores, mascara top-k, W_q per-modulo (v5.1)
+  - _MultiHeadCommResidual: residual, inactivos congelados, mascara filas (v5.1)
+  - _GlobalWorkspace: ciclo write/broadcast, shapes, buffer dinamico (v5.1)
+  - _DVNCCodebook: cuantizacion, vq_loss, straight-through, commitment adaptativo (v5.1)
   - RecurrentIndependentMechanisms: todos los modos, shapes, sparsidad,
-    gradientes, fast/slow params, manejo de secuencias y puntuales,
-    estado inicial, routing gumbel
-  - RIMsState: to_dict consistencia
+    gradientes, fast/slow params (con validacion exhaustiva v5.1),
+    manejo de secuencias y puntuales, estado inicial, routing gumbel,
+    inactivity decay (v5.1), fingerprint NCO (v5.1),
+    softmax sin NaN (v5.1), temperatura softplus (v5.1)
+  - RIMsState: to_dict consistencia (con campos v5.1)
 
 Ejecutar:
     python -m pytest tests_rims.py -v
@@ -46,7 +48,6 @@ def _make_msc_mocks():
     class LayerConfig:
         pass
 
-    # Inyectar en sys.modules para que el import de rims.py los encuentre
     base_mod   = types.ModuleType('consciousness.layers.base')
     config_mod = types.ModuleType('consciousness.layers.config')
     base_mod.ConsciousnessLayerBase   = ConsciousnessLayerBase
@@ -56,22 +57,17 @@ def _make_msc_mocks():
     sys.modules['consciousness.layers.base']   = base_mod
     sys.modules['consciousness.layers.config'] = config_mod
 
-    # Parchear los imports relativos en rims.py a absolutos
     return ConsciousnessLayerBase, LayerConfig
 
 
 ConsciousnessLayerBase, LayerConfig = _make_msc_mocks()
 
-# Ahora importar el modulo como si fuera parte del paquete
-import importlib, importlib.util, pathlib
+import importlib, importlib.util, importlib.abc, pathlib
 
 _rims_path = pathlib.Path(__file__).parent / 'rims.py'
 _spec = importlib.util.spec_from_file_location('rims', _rims_path)
 _mod  = importlib.util.module_from_spec(_spec)
-# Parchear imports relativos
 _mod.__package__ = 'consciousness.layers'
-# Remplazar .base y .config en el modulo antes de ejecutar
-import builtins, importlib.abc
 
 class _RelativeImportFinder(importlib.abc.MetaPathFinder):
     def find_spec(self, fullname, path, target=None):
@@ -90,6 +86,7 @@ _GlobalWorkspace                = _mod._GlobalWorkspace
 _DVNCCodebook                   = _mod._DVNCCodebook
 RIMsState                       = _mod.RIMsState
 RecurrentIndependentMechanisms  = _mod.RecurrentIndependentMechanisms
+_compute_fingerprint            = _mod._compute_fingerprint
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -150,12 +147,10 @@ class TestGroupGRUCell(unittest.TestCase):
         h1 = self.cell(x, h).detach().clone()
 
         x2 = x.clone()
-        x2[:, 0] += 100.0   # perturbar solo grupo 0
+        x2[:, 0] += 100.0
         h2 = self.cell(x2, h).detach()
 
-        # Grupos 1..K-1 deben ser identicos
         self.assertTrue(torch.allclose(h1[:, 1:], h2[:, 1:], atol=1e-5))
-        # Grupo 0 debe haber cambiado
         self.assertFalse(torch.allclose(h1[:, 0], h2[:, 0], atol=1e-5))
 
 
@@ -190,6 +185,57 @@ class TestInputAttentionRIM(unittest.TestCase):
         scores.sum().backward()
         self.assertTrue(_has_grad(x))
 
+    # ---- v5.1 ----
+
+    def test_per_module_wq(self):
+        """v5.1: W_q debe ser [K, d_key, rim_size] y cada modulo debe tener
+        su propia proyeccion independiente."""
+        d_key = 32
+        layer = _InputAttentionRIM(
+            hidden_size=128, rim_size=rim, num_rims=K, d_key=d_key
+        )
+        # Shape del parametro
+        self.assertEqual(layer.W_q.shape, (K, d_key, rim))
+
+        # Perturbar W_q del modulo 0 — solo scores[0] debe cambiar
+        x = torch.randn(B, 128)
+        h = torch.randn(B, K, rim)
+        _, scores_before = layer(x, h)
+        scores_before = scores_before.detach().clone()
+
+        with torch.no_grad():
+            layer.W_q[0] += 10.0  # perturbar solo modulo 0
+
+        _, scores_after = layer(x, h)
+        scores_after = scores_after.detach()
+
+        # Modulo 0 debe haber cambiado
+        self.assertFalse(
+            torch.allclose(scores_before[:, 0], scores_after[:, 0], atol=1e-4),
+            "Perturbar W_q[0] debe cambiar scores del modulo 0"
+        )
+        # Modulos 1..K-1 deben ser identicos
+        self.assertTrue(
+            torch.allclose(scores_before[:, 1:], scores_after[:, 1:], atol=1e-5),
+            "Perturbar W_q[0] NO debe cambiar scores de modulos 1+"
+        )
+
+        # Gradiente debe fluir por cada W_q independientemente
+        layer2 = _InputAttentionRIM(
+            hidden_size=128, rim_size=rim, num_rims=K, d_key=d_key
+        )
+        x2 = torch.randn(B, 128)
+        h2 = torch.randn(B, K, rim)
+        _, scores2 = layer2(x2, h2)
+        # Backprop solo a traves del modulo 2
+        scores2[:, 2].sum().backward()
+        # W_q[2] debe tener gradiente, W_q[0] no (o ~0)
+        grad_mod2 = layer2.W_q.grad[2].abs().sum().item()
+        grad_mod0 = layer2.W_q.grad[0].abs().sum().item()
+        self.assertGreater(grad_mod2, 1e-8, "W_q[2] debe tener gradiente")
+        self.assertAlmostEqual(grad_mod0, 0.0, places=6,
+            msg="W_q[0] no debe tener gradiente si backprop solo pasa por modulo 2")
+
 
 # ============================================================================
 # Tests _MultiHeadCommResidual
@@ -213,20 +259,16 @@ class TestMultiHeadCommResidual(unittest.TestCase):
 
     def test_inactive_unchanged(self):
         """Modulos inactivos deben recibir 0 de comunicacion -> su contribucion al output
-        viene solo del residual. La salida para inactivos debe ser LayerNorm(h + 0)."""
+        viene solo del residual."""
         torch.manual_seed(0)
         h    = torch.randn(B, K, rim)
         mask = torch.zeros(B, K, dtype=torch.bool)
-        mask[:, :Ka] = True            # solo primeros Ka activos
+        mask[:, :Ka] = True
 
         out = self.layer(h, mask)
 
-        # Para inactivos: out = LN(h + 0 * attn_result)
-        # Verificamos que la norma de la diferencia entre activos e inactivos
-        # no sea cero (activos reciben informacion extra)
         active_norm   = (out[:, :Ka]  - h[:, :Ka]).norm().item()
         inactive_norm = (out[:, Ka:]  - h[:, Ka:]).norm().item()
-        # Inactivos deben tener menor delta que activos (o igual si attn=0)
         self.assertGreaterEqual(active_norm, 0.0)
         self.assertGreaterEqual(inactive_norm, 0.0)
 
@@ -237,6 +279,38 @@ class TestMultiHeadCommResidual(unittest.TestCase):
         out  = self.layer(h, mask)
         out.sum().backward()
         self.assertTrue(_has_grad(h))
+
+    # ---- v5.1 ----
+
+    def test_comm_mask_rows_not_cols(self):
+        """v5.1: La mascara debe aplicarse a FILAS (queries de inactivos), no a
+        COLUMNAS (sources). Todos los modulos — activos e inactivos — deben ser
+        accesibles como fuente (keys/values).
+
+        Test: si un modulo inactivo tiene un estado muy distinto, los activos
+        deben poder "verlo" y su output debe cambiar."""
+        torch.manual_seed(42)
+        layer = _MultiHeadCommResidual(rim_size=rim, num_heads=4)
+
+        h = torch.randn(B, K, rim)
+        mask = torch.zeros(B, K, dtype=torch.bool)
+        mask[:, :Ka] = True  # modulos 0,1,2 activos; 3,4,5 inactivos
+
+        # Baseline
+        out_baseline = layer(h, mask).detach().clone()
+
+        # Perturbar un modulo INACTIVO (modulo 5) con un estado muy fuerte
+        h2 = h.clone()
+        h2[:, 5] = h2[:, 5] + 50.0
+
+        out_perturbed = layer(h2, mask).detach()
+
+        # Si la mascara es correcta (filas, no columnas), los modulos ACTIVOS
+        # deben producir output diferente porque pueden leer del modulo 5 como fuente
+        active_delta = (out_perturbed[:, :Ka] - out_baseline[:, :Ka]).abs().mean().item()
+        self.assertGreater(active_delta, 0.1,
+            "v5.1: Los activos deben poder leer de inactivos como fuente (keys/values). "
+            "Si este test falla, la mascara probablemente bloquea columnas en vez de filas.")
 
 
 # ============================================================================
@@ -264,7 +338,6 @@ class TestGlobalWorkspace(unittest.TestCase):
         mask[:, :Ka] = True
         out  = self.layer(h, mask)
 
-        # Al menos algunos modulos inactivos deben haber cambiado
         inactive_delta = (out[:, Ka:] - h[:, Ka:]).abs().mean().item()
         self.assertGreater(inactive_delta, 1e-6,
             "GWT broadcast debe afectar tambien a modulos inactivos")
@@ -293,7 +366,7 @@ class TestDVNCCodebook(unittest.TestCase):
         mask[:, :Ka] = True
         out, vq_loss = self.layer(h, mask)
         self.assertEqual(out.shape, (B, K, rim))
-        self.assertEqual(vq_loss.shape, ())  # scalar
+        self.assertEqual(vq_loss.shape, ())
 
     def test_vq_loss_positive(self):
         h    = torch.randn(B, K, rim)
@@ -316,7 +389,6 @@ class TestDVNCCodebook(unittest.TestCase):
         torch.manual_seed(7)
         h     = torch.randn(B, K, rim)
         mask  = torch.zeros(B, K, dtype=torch.bool)
-        # Ningun modulo activo
         mask_all_off = mask.clone()
         out_off, _ = self.layer(h, mask_all_off)
 
@@ -324,12 +396,7 @@ class TestDVNCCodebook(unittest.TestCase):
         mask_some[:, :Ka] = True
         out_some, _ = self.layer(h, mask_some)
 
-        # Los inactivos (Ka:) deben tener la misma salida cuando nadie esta activo
-        # que cuando los primeros Ka estan activos (porque los inactivos reciben 0)
-        # Esto verifica que row_mask funciona correctamente
-        # (La norma de diferencia para los inactivos debe ser pequenia)
         diff = (out_off[:, Ka:] - out_some[:, Ka:]).abs().mean().item()
-        # Pueden diferir ligeramente por LayerNorm pero deben ser similares
         self.assertLess(diff, 1.0)
 
 
@@ -357,8 +424,12 @@ class TestRIMsGeneral(unittest.TestCase):
         _, state = model(x)
         self.assertEqual(state.hidden_states.shape,     (B, K, rim))
         self.assertEqual(state.active_rims.shape,       (B, K))
-        self.assertEqual(state.attention_weights.shape, (B, K))
-        self.assertEqual(state.communication.shape,     (B, K, rim))
+        self.assertEqual(state.attention_weights.shape,  (B, K))
+        self.assertEqual(state.communication.shape,      (B, K, rim))
+        # v5.1 campos
+        self.assertEqual(state.inactivity_steps.shape,   (B, K))
+        self.assertIsInstance(state.fingerprint, str)
+        self.assertEqual(len(state.fingerprint), 16)
 
     def test_sparsity_exact(self):
         """Exactamente Ka modulos deben estar activos por muestra."""
@@ -381,15 +452,22 @@ class TestRIMsGeneral(unittest.TestCase):
         model = _rims()
         x = torch.randn(B, 5, 128)
         _, state1 = model(x)
-        # Continuar desde el estado anterior
         x2 = torch.randn(B, 5, 128)
-        out2, _ = model(x2, hidden=state1.hidden_states)
+        out2, _ = model(x2, hidden=state1.hidden_states,
+                        inactivity_steps=state1.inactivity_steps)
         self.assertEqual(out2.shape, (B, 5, D))
 
     def test_reset_hidden_shape(self):
+        """v5.1: reset_hidden retorna Tuple[Tensor, Tensor]."""
         model  = _rims()
-        h = model.reset_hidden(B, torch.device('cpu'))
+        result = model.reset_hidden(B, torch.device('cpu'))
+        self.assertIsInstance(result, tuple)
+        self.assertEqual(len(result), 2)
+        h, inact = result
         self.assertEqual(h.shape, (B, K, rim))
+        self.assertEqual(inact.shape, (B, K))
+        self.assertEqual(inact.dtype, torch.long)
+        self.assertTrue((inact == 0).all())
 
     def test_attention_weights_sum_to_one(self):
         """Los pesos de atencion (softmax) deben sumar 1 por muestra."""
@@ -400,25 +478,21 @@ class TestRIMsGeneral(unittest.TestCase):
         self.assertTrue(torch.allclose(sums, torch.ones(B), atol=1e-5))
 
     def test_inactive_hidden_unchanged(self):
-        """Los modulos inactivos deben conservar exactamente su hidden previo."""
-        model = _rims()
+        """Los modulos inactivos deben conservar mayormente su hidden previo."""
+        model = _rims(inactivity_decay=0.0)  # sin decay para test limpio
         model.eval()
-        h0 = model.reset_hidden(B, torch.device('cpu'))
+        h0, inact0 = model.reset_hidden(B, torch.device('cpu'))
         x  = torch.randn(B, 128)
 
         with torch.no_grad():
-            _, state = model(x, hidden=h0)
+            _, state = model(x, hidden=h0, inactivity_steps=inact0)
 
-        active = state.active_rims    # [B, K] bool
+        active = state.active_rims
         inactive = ~active
 
-        # Para cada muestra, los hidden inactivos deben igualar h0
-        # Nota: hay LayerNorm post-update que afecta TODO el hidden,
-        # asi que verificamos que el delta sea menor para inactivos que activos
         delta = (state.hidden_states - h0).abs()
         active_delta   = delta[active].mean().item()   if active.any()   else 0.0
         inactive_delta = delta[inactive].mean().item() if inactive.any() else 0.0
-        # Los activos deben haber cambiado mas
         self.assertGreaterEqual(active_delta, inactive_delta)
 
     def test_to_dict_keys(self):
@@ -427,7 +501,8 @@ class TestRIMsGeneral(unittest.TestCase):
         _, state = model(x)
         d = state.to_dict()
         for key in ('num_active', 'activation_rate', 'attention_entropy',
-                    'comm_norm', 'vq_loss'):
+                    'comm_norm', 'vq_loss',
+                    'max_inactivity', 'mean_inactivity', 'fingerprint'):  # v5.1
             self.assertIn(key, d)
 
     def test_get_statistics_keys(self):
@@ -435,7 +510,8 @@ class TestRIMsGeneral(unittest.TestCase):
         x = torch.randn(B, 5, 128)
         model(x)
         stats = model.get_statistics()
-        for key in ('num_rims', 'num_active', 'rim_size', 'comm_mode', 'routing'):
+        for key in ('num_rims', 'num_active', 'rim_size', 'comm_mode', 'routing',
+                    'inactivity_decay', 'max_inactivity', 'mean_inactivity'):  # v5.1
             self.assertIn(key, stats)
 
 
@@ -507,9 +583,39 @@ class TestRIMsRouting(unittest.TestCase):
         self.assertTrue(torch.allclose(out1, out2))
 
     def test_gumbel_temp_is_learnable(self):
+        """v5.1: el parametro es _raw_gumbel_temp, accesible via property."""
         model = _rims(routing='gumbel')
-        found = any(p is model.log_gumbel_temp for p in model.parameters())
+        found = any(p is model._raw_gumbel_temp for p in model.parameters())
         self.assertTrue(found)
+
+    # ---- v5.1 ----
+
+    def test_gumbel_softplus_gradient(self):
+        """v5.1: La temperatura via softplus debe tener gradiente continuo
+        en todo el rango, incluyendo valores extremos."""
+        model = _rims(routing='gumbel')
+        model.train()
+
+        for raw_val in [-5.0, 0.0, 5.0, 20.0]:
+            with torch.no_grad():
+                model._raw_gumbel_temp.fill_(raw_val)
+
+            x = torch.randn(B, 3, 128)
+            out, _ = model(x)
+            out.sum().backward()
+
+            grad = model._raw_gumbel_temp.grad
+            self.assertIsNotNone(grad,
+                f"Gradiente de temperatura debe existir con raw={raw_val}")
+            self.assertTrue(torch.isfinite(grad).all(),
+                f"Gradiente de temperatura debe ser finito con raw={raw_val}")
+
+            model.zero_grad()
+
+        # Verificar que gumbel_temp nunca baja de 0.1
+        with torch.no_grad():
+            model._raw_gumbel_temp.fill_(-100.0)  # extremo bajo
+        self.assertGreaterEqual(model.gumbel_temp.item(), 0.1)
 
 
 # ============================================================================
@@ -541,7 +647,6 @@ class TestFastSlowParams(unittest.TestCase):
     def test_fast_params_gradients(self):
         """Solo los fast params deben recibir gradiente en un paso interno."""
         model = _rims()
-        # Congelar slow params
         for p in model.slow_params():
             p.requires_grad_(False)
 
@@ -552,6 +657,29 @@ class TestFastSlowParams(unittest.TestCase):
         for p in model.fast_params():
             if p.requires_grad:
                 self.assertIsNotNone(p.grad)
+
+    # ---- v5.1 ----
+
+    def test_fast_slow_exhaustive_validation(self):
+        """v5.1: La validacion en __init__ debe pasar para todos los comm_modes.
+        Este test verifica que no lanza RuntimeError."""
+        for mode in ('standard', 'gwt', 'dvnc'):
+            try:
+                model = _rims(comm_mode=mode)
+            except RuntimeError as e:
+                self.fail(
+                    f"_validate_param_groups() fallo para comm_mode='{mode}': {e}"
+                )
+
+            # Doble verificacion: conteo exacto
+            all_p = list(model.parameters())
+            fast  = model.fast_params()
+            slow  = model.slow_params()
+            self.assertEqual(
+                len(fast) + len(slow), len(all_p),
+                f"comm_mode='{mode}': fast({len(fast)}) + slow({len(slow)}) "
+                f"!= total({len(all_p)})"
+            )
 
 
 # ============================================================================
@@ -577,7 +705,7 @@ class TestRIMsValidation(unittest.TestCase):
     def test_hidden_not_divisible(self):
         with self.assertRaises(ValueError):
             RecurrentIndependentMechanisms(
-                input_size=64, hidden_size=100,  # 100 % 6 != 0
+                input_size=64, hidden_size=100,
                 num_rims=K, num_active=Ka
             )
 
@@ -588,6 +716,163 @@ class TestRIMsValidation(unittest.TestCase):
                 num_rims=K, num_active=Ka,
                 comm_mode='invalid'
             )
+
+
+# ============================================================================
+# v5.1: Tests de inactivity decay
+# ============================================================================
+
+class TestInactivityDecay(unittest.TestCase):
+
+    def test_inactivity_counter_increments(self):
+        """Contadores de inactividad deben incrementar para inactivos
+        y resetear a 0 para activos."""
+        model = _rims(inactivity_decay=0.01)
+        model.eval()
+
+        h, inact = model.reset_hidden(B, torch.device('cpu'))
+        self.assertTrue((inact == 0).all())
+
+        x = torch.randn(B, 128)
+        with torch.no_grad():
+            _, state = model(x, hidden=h, inactivity_steps=inact)
+
+        # Activos deben tener contador 0
+        active_counts = state.inactivity_steps[state.active_rims]
+        self.assertTrue((active_counts == 0).all(),
+            "Modulos activos deben tener inactivity_steps=0")
+
+        # Inactivos deben tener contador 1 (primer paso)
+        inactive_counts = state.inactivity_steps[~state.active_rims]
+        self.assertTrue((inactive_counts == 1).all(),
+            "Modulos inactivos deben tener inactivity_steps=1 despues del primer paso")
+
+    def test_inactivity_decay_reduces_norm(self):
+        """Modulos inactivos durante muchos pasos deben tener menor norma
+        que al inicio cuando decay > 0."""
+        model = _rims(inactivity_decay=0.05)  # decay agresivo para test
+        model.eval()
+
+        h, inact = model.reset_hidden(B, torch.device('cpu'))
+        # Forzar un estado fuerte en todos los modulos
+        h = h + 5.0
+        initial_norm = h.norm(dim=-1).mean().item()
+
+        # Simular inactividad larga forzando contadores altos
+        inact = torch.full((B, K), 80, dtype=torch.long)  # 80 pasos inactivo
+
+        x = torch.randn(B, 128)
+        with torch.no_grad():
+            _, state = model(x, hidden=h, inactivity_steps=inact)
+
+        # Modulos que siguen inactivos deben tener norma reducida
+        inactive = ~state.active_rims
+        if inactive.any():
+            decayed_norm = state.hidden_states[inactive].norm(dim=-1).mean().item()
+            original_inactive_norm = h.expand_as(state.hidden_states)[inactive].norm(dim=-1).mean().item()
+            self.assertLess(decayed_norm, original_inactive_norm * 0.99,
+                "Decay debe reducir la norma de modulos inactivos")
+
+    def test_zero_decay_no_effect(self):
+        """Con inactivity_decay=0, los contadores se mantienen pero no hay decay."""
+        model = _rims(inactivity_decay=0.0)
+        model.eval()
+
+        h = torch.randn(B, K, rim) * 5.0
+        inact = torch.full((B, K), 50, dtype=torch.long)
+
+        x = torch.randn(B, 128)
+        with torch.no_grad():
+            _, state = model(x, hidden=h, inactivity_steps=inact)
+
+        # Los contadores aun deben incrementar/resetear
+        inactive = ~state.active_rims
+        if inactive.any():
+            self.assertTrue((state.inactivity_steps[inactive] == 51).all())
+
+
+# ============================================================================
+# v5.1: Tests de NCO fingerprint
+# ============================================================================
+
+class TestFingerprint(unittest.TestCase):
+
+    def test_fingerprint_deterministic(self):
+        """Mismo estado -> mismo hash, deterministico."""
+        h = torch.randn(B, K, rim)
+        fp1 = _compute_fingerprint(h)
+        fp2 = _compute_fingerprint(h)
+        self.assertEqual(fp1, fp2)
+
+    def test_fingerprint_length(self):
+        """Hash debe ser de 16 caracteres hex."""
+        h = torch.randn(B, K, rim)
+        fp = _compute_fingerprint(h)
+        self.assertEqual(len(fp), 16)
+        # Debe ser hex valido
+        int(fp, 16)
+
+    def test_fingerprint_changes_with_state(self):
+        """Estados diferentes deben producir hashes diferentes."""
+        h1 = torch.randn(B, K, rim)
+        h2 = h1.clone()
+        h2[0, 0, 0] += 0.01  # perturbacion pequenia pero >precision
+
+        fp1 = _compute_fingerprint(h1)
+        fp2 = _compute_fingerprint(h2)
+        self.assertNotEqual(fp1, fp2)
+
+    def test_fingerprint_ignores_float_noise(self):
+        """Perturbaciones menores que la precision (1e-4) no deben cambiar el hash."""
+        h = torch.randn(B, K, rim)
+        h2 = h + 1e-6  # ruido menor que 1e-4 (precision=4)
+
+        fp1 = _compute_fingerprint(h)
+        fp2 = _compute_fingerprint(h2)
+        self.assertEqual(fp1, fp2,
+            "Ruido de float por debajo de la precision no debe cambiar el fingerprint")
+
+    def test_fingerprint_in_rims_state(self):
+        """El fingerprint debe estar presente y ser valido en RIMsState."""
+        model = _rims()
+        x = torch.randn(B, 5, 128)
+        _, state = model(x)
+
+        self.assertIsInstance(state.fingerprint, str)
+        self.assertEqual(len(state.fingerprint), 16)
+        # Debe ser reproducible
+        fp_recomputed = _compute_fingerprint(state.hidden_states)
+        self.assertEqual(state.fingerprint, fp_recomputed)
+
+
+# ============================================================================
+# v5.1: Test de softmax sin NaN
+# ============================================================================
+
+class TestNumericalStability(unittest.TestCase):
+
+    def test_softmax_no_nan_all_inactive(self):
+        """v5.1: Si ningun modulo esta activo (edge case), la comunicacion
+        no debe producir NaN — debe retornar hidden sin cambios (o con LN)."""
+        # _MultiHeadCommResidual con mascara completamente False
+        layer = _MultiHeadCommResidual(rim_size=rim, num_heads=4)
+        h = torch.randn(B, K, rim)
+        mask = torch.zeros(B, K, dtype=torch.bool)  # nadie activo
+
+        out = layer(h, mask)
+        self.assertTrue(torch.isfinite(out).all(),
+            "v5.1: Output de comunicacion no debe contener NaN/Inf "
+            "incluso con 0 modulos activos")
+
+    def test_softmax_no_nan_gwt_no_active(self):
+        """v5.1: GWT con 0 activos no debe producir NaN."""
+        layer = _GlobalWorkspace(rim_size=rim, num_rims=K, ws_slots=2)
+        h = torch.randn(B, K, rim)
+        mask = torch.zeros(B, K, dtype=torch.bool)
+
+        out = layer(h, mask)
+        self.assertTrue(torch.isfinite(out).all(),
+            "v5.1: GWT output no debe contener NaN/Inf con 0 modulos activos")
 
 
 # ============================================================================
@@ -608,6 +893,10 @@ if __name__ == '__main__':
         TestRIMsRouting,
         TestFastSlowParams,
         TestRIMsValidation,
+        # v5.1
+        TestInactivityDecay,
+        TestFingerprint,
+        TestNumericalStability,
     ]:
         suite.addTests(loader.loadTestsFromTestCase(cls))
 
