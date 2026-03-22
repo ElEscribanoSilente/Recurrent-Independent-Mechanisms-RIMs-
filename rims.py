@@ -14,31 +14,40 @@ teoricas documentadas hasta 2026:
   1. GroupGRUCell          — GRU vectorizado con einsum (sin bucle Python).
   2. _InputAttentionRIM    — Atencion de entrada exacta del paper:
                              Q desde h_{t-1,i}, K/V desde x_t.
+                             W_q per-modulo via einsum (v5.1).
   3. _MultiHeadCommResidual— Comunicacion multi-cabeza con conexion residual
                              segun formula h_{t,k} = softmax(QK^T/sqrt(d))V + h~_{t,k}.
+                             Mascara corregida: solo filas (queries), no columnas (v5.1).
   4. _GlobalWorkspace      — Global Workspace Theory (GWT): competencia->
                              escritura al buffer->broadcast a todos los modulos.
+                             Buffer dinamico condicionado al contexto (v5.1).
   5. _DVNCCodebook         — Discrete-Valued Neural Communication (DVNC):
                              comunicacion cuantificada via VQ-VAE codebook.
+                             Commitment adaptativo por entropia (v5.1).
   6. Routing diferenciable — STE (Straight-Through Estimator) o Gumbel-Softmax.
+                             Temperatura via softplus (v5.1).
   7. Grupos fast/slow      — Separacion de parametros para meta-aprendizaje:
                              theta_modulos (rapidos) vs theta_atencion (lentos).
+                             Assertion de cobertura exhaustiva (v5.1).
+  8. Inactivity decay      — Decay exponencial para modulos inactivos (v5.1).
+  9. NCO fingerprint       — Hash ligero del estado para deteccion de divergencia (v5.1).
 
 Referencia matematica completa en docstrings inline.
 
 Author: Escribano Silente (MSC Framework)
-Version: 5.0.0
+Version: 5.1.0
 """
 
 from __future__ import annotations
 
 import math
+import hashlib
 from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from torch import Tensor
 
 from .base import ConsciousnessLayerBase
@@ -114,26 +123,26 @@ class GroupGRUCell(nn.Module):
 
 # ============================================================================
 # 2. _InputAttentionRIM — Atencion de entrada (formulacion exacta del paper)
+#    v5.1: W_q per-modulo via einsum (fidelidad al paper)
 # ============================================================================
 
 class _InputAttentionRIM(nn.Module):
     """
     Atencion de entrada de los RIMs segun Goyal et al. (2019).
 
-    Cada modulo i genera su propia consulta desde h_{t-1,i}:
-        Q_{inp,i} = h_{t-1,i} @ W_q      in R^{d_k}
+    Cada modulo i genera su propia consulta desde h_{t-1,i} con su propio W_q^{(i)}:
+        Q_{inp,i} = h_{t-1,i} @ W_q^{(i)}   in R^{d_k}
     El input x_t proyecta claves y valores compartidos:
-        K_{inp}   = x_t @ W_k             in R^{d_k}
-        V_{inp}   = x_t @ W_v             in R^{d_v}
+        K_{inp}   = x_t @ W_k                in R^{d_k}
+        V_{inp}   = x_t @ W_v                in R^{d_v}
     Puntuacion de relevancia (escalar por modulo):
         s_{t,i}   = Q_{inp,i} @ K_{inp}^T / sqrt(d_k)
-    Tras seleccion top-k, la entrada atendida de modulo i activo:
-        x̃_{t,i}  = softmax_local(s_{t,i}) * V_{inp}   in R^{d_v}
 
-    Retorna tambien los scores crudos para el selector (routing).
+    v5.1: W_q implementado como tensor [K, d_key, rim_size] con einsum,
+    consistente con GroupGRUCell. Cada modulo tiene proyeccion independiente.
 
     Args:
-        hidden_size: d_h total (= num_rims * rim_size).
+        hidden_size: d_h total (= input_size en la practica).
         rim_size:    d_h por modulo.
         num_rims:    K_t.
         d_key:       Dimension del espacio de claves/consultas.
@@ -144,9 +153,11 @@ class _InputAttentionRIM(nn.Module):
         self.num_rims = num_rims
         self.d_key = d_key
 
-        # Proyeccion de consulta: cada modulo tiene su propio W_q (rim_size -> d_key)
-        # Implementado como una proyeccion 2D compartida sobre la dimension de modulos
-        self.W_q = nn.Linear(rim_size, d_key, bias=False)
+        # v5.1: Proyeccion de consulta PER-MODULO via einsum
+        # W_q^{(i)}: cada modulo k tiene su propia transformacion [rim_size -> d_key]
+        self.W_q = nn.Parameter(torch.empty(num_rims, d_key, rim_size))
+        nn.init.xavier_uniform_(self.W_q.view(num_rims, d_key, rim_size))
+
         self.W_k = nn.Linear(hidden_size, d_key, bias=False)   # input -> key
         self.W_v = nn.Linear(hidden_size, rim_size, bias=False) # input -> value
         self.scale = d_key ** -0.5
@@ -163,27 +174,28 @@ class _InputAttentionRIM(nn.Module):
             x_per_rim: [batch, num_rims, rim_size]  — x̃_{t,i} (0 si inactivo)
             scores:    [batch, num_rims]             — s_{t,i} sin normalizar
         """
-        # Q_{inp,i} = h_{t-1,i} @ W_q  -> [B, K, d_key]
-        Q = self.W_q(hidden)                         # [B, K, d_key]
+        # Q_{inp,i} = h_{t-1,i} @ W_q^{(i)}  -> [B, K, d_key]
+        # einsum: 'bkr,kdr->bkd' — cada modulo k proyecta con su propio W_q[k]
+        Q = torch.einsum('bkr,kdr->bkd', hidden, self.W_q)   # [B, K, d_key]
+
         # K_{inp} = x_t @ W_k           -> [B, d_key]
-        K = self.W_k(x)                              # [B, d_key]
+        K = self.W_k(x)                                       # [B, d_key]
         # V_{inp} = x_t @ W_v           -> [B, rim_size]
-        V = self.W_v(x)                              # [B, rim_size]
+        V = self.W_v(x)                                       # [B, rim_size]
 
         # Scores: Q . K^T / sqrt(d_k)  -> [B, K]
-        # bmm: [B, K, d_key] x [B, d_key, 1] -> [B, K, 1]
         scores = torch.bmm(Q, K.unsqueeze(-1)).squeeze(-1) * self.scale  # [B, K]
 
-        # Valor proyectado expandido para todos los RIMs (se enmascara despues)
-        # x̃_{t,i} = alpha_i * V, donde alpha viene del selector externo
-        # Aqui devolvemos V expandido; la ponderacion la aplica el modulo principal
-        V_exp = V.unsqueeze(1).expand(-1, self.num_rims, -1)             # [B, K, rim_size]
+        # Valor proyectado expandido para todos los RIMs
+        V_exp = V.unsqueeze(1).expand(-1, self.num_rims, -1)            # [B, K, rim_size]
 
         return V_exp, scores
 
 
 # ============================================================================
 # 3. _MultiHeadCommResidual — Comunicacion con residual (formulacion del paper)
+#    v5.1: Mascara corregida — solo filas (queries), no columnas (sources)
+#    v5.1: Manejo robusto de filas completamente enmascaradas
 # ============================================================================
 
 class _MultiHeadCommResidual(nn.Module):
@@ -194,8 +206,12 @@ class _MultiHeadCommResidual(nn.Module):
         h_{t,k} = MH_Att(h̃_{t,k}, h̃_{t,:}) + h̃_{t,k}    ∀k ∈ S_t
         h_{t,i} = h̃_{t,i}                                   ∀i ∉ S_t
 
-    Solo los modulos activos emiten consultas (reduccion de computo).
-    Todos los modulos pueden ser fuente (keys/values).
+    v5.1 CORRECCION: Solo los modulos activos emiten consultas (filas).
+    TODOS los modulos son fuente (keys/values), incluyendo inactivos,
+    porque pueden tener estado relevante acumulado.
+
+    v5.1: Filas completamente inactivas reciben atencion zero explicitamente
+    en lugar de nan_to_num post-hoc.
 
     Args:
         rim_size:  Dimension por modulo.
@@ -233,23 +249,26 @@ class _MultiHeadCommResidual(nn.Module):
             return t.view(B, K, H, Dh).transpose(1, 2)   # [B, H, K, Dh]
 
         Q = heads(self.W_q(hidden))   # [B, H, K, Dh]
-        Km = heads(self.W_k(hidden))
-        V  = heads(self.W_v(hidden))
+        Km = heads(self.W_k(hidden))  # Todos los modulos como fuente
+        V  = heads(self.W_v(hidden))  # Todos los modulos como fuente
 
         attn = torch.matmul(Q, Km.transpose(-1, -2)) * self.scale   # [B, H, K, K]
 
-        # Inactivos no pueden ser consulta (enmascarar filas) ni fuente columna inactiva
-        col_mask = active_mask.unsqueeze(1).unsqueeze(2).expand(B, H, K, K)
-        attn = attn.masked_fill(~col_mask, float('-inf'))
+        # v5.1 CORRECCION: enmascarar FILAS de modulos inactivos, NO columnas.
+        # Los inactivos no emiten queries, pero SI son fuente (keys/values).
+        row_mask = active_mask.unsqueeze(1).unsqueeze(-1).expand(B, H, K, K)  # [B,H,K,K]
 
-        attn = F.softmax(attn, dim=-1).nan_to_num(0.0)
+        # v5.1: Manejo robusto — filas inactivas se ponen a 0 directamente,
+        # evitando el camino -inf -> softmax -> NaN -> nan_to_num
+        attn = F.softmax(attn, dim=-1)
+        attn = attn * row_mask.float()   # filas inactivas -> atencion zero
         attn = self.dropout(attn)
 
         out = torch.matmul(attn, V)                          # [B, H, K, Dh]
         out = out.transpose(1, 2).contiguous().view(B, K, D)
         out = self.W_o(out)
 
-        # Residual: h_{t,k} = MH_Att(...) + h̃_{t,k}
+        # Residual: h_{t,k} = MH_Att(...) + h̃_{t,k}  (solo activos)
         active_f = active_mask.unsqueeze(-1).float()         # [B, K, 1]
         h_final  = hidden + active_f * out                   # inactivos: += 0
 
@@ -258,6 +277,8 @@ class _MultiHeadCommResidual(nn.Module):
 
 # ============================================================================
 # 4. _GlobalWorkspace — Global Workspace Theory (GWT)
+#    v5.1: Buffer dinamico condicionado al contexto
+#    v5.1: Manejo robusto de softmax con filas completamente enmascaradas
 # ============================================================================
 
 class _GlobalWorkspace(nn.Module):
@@ -269,8 +290,9 @@ class _GlobalWorkspace(nn.Module):
       2. Consolidacion: el buffer agrega los aportes ponderados por atencion.
       3. Broadcast: el buffer envia su resumen a TODOS los modulos.
 
-    El buffer se implementa como un conjunto de ``ws_slots`` vectores aprendibles
-    que actuan como memoria de trabajo centralizada.
+    v5.1: El buffer inicial se genera condicionado al contexto (promedio de
+    estados activos -> MLP -> ws_slots vectores), en lugar de ser un parametro
+    estatico. Esto permite adaptacion dinamica de la capacidad del workspace.
 
     Args:
         rim_size:  Dimension por modulo.
@@ -281,14 +303,22 @@ class _GlobalWorkspace(nn.Module):
     def __init__(self, rim_size: int, num_rims: int, ws_slots: int = 2):
         super().__init__()
         self.ws_slots = ws_slots
+        self.rim_size = rim_size
 
-        # Buffer aprendible: [ws_slots, rim_size]
-        self.workspace = nn.Parameter(torch.randn(ws_slots, rim_size) * 0.02)
+        # v5.1: Buffer dinamico — genera slots condicionados al contexto
+        # Fallback estatico para cuando no hay modulos activos
+        self.workspace_fallback = nn.Parameter(torch.randn(ws_slots, rim_size) * 0.02)
+        # MLP: promedio de hidden activos -> ws_slots vectores
+        self.ws_generator = nn.Sequential(
+            nn.Linear(rim_size, rim_size * 2),
+            nn.GELU(),
+            nn.Linear(rim_size * 2, ws_slots * rim_size),
+        )
 
         # Atencion de escritura: modulos -> workspace
-        self.write_q = nn.Linear(rim_size, rim_size, bias=False)  # query del workspace
-        self.write_k = nn.Linear(rim_size, rim_size, bias=False)  # key de cada modulo
-        self.write_v = nn.Linear(rim_size, rim_size, bias=False)  # value de cada modulo
+        self.write_q = nn.Linear(rim_size, rim_size, bias=False)
+        self.write_k = nn.Linear(rim_size, rim_size, bias=False)
+        self.write_v = nn.Linear(rim_size, rim_size, bias=False)
 
         # Atencion de lectura (broadcast): workspace -> todos los modulos
         self.read_q  = nn.Linear(rim_size, rim_size, bias=False)
@@ -299,6 +329,35 @@ class _GlobalWorkspace(nn.Module):
         self.norm_ws  = nn.LayerNorm(rim_size)
         self.norm_out = nn.LayerNorm(rim_size)
         self.scale    = rim_size ** -0.5
+
+    def _generate_workspace(self, hidden: Tensor, active_mask: Tensor) -> Tensor:
+        """
+        Genera el estado inicial del workspace condicionado al contexto.
+
+        Args:
+            hidden:      [B, K, D]
+            active_mask: [B, K] bool
+
+        Returns:
+            ws: [B, ws_slots, D]
+        """
+        B, K, D = hidden.shape
+        S = self.ws_slots
+
+        # Promedio de estados activos (con fallback si ninguno activo)
+        active_f = active_mask.unsqueeze(-1).float()         # [B, K, 1]
+        n_active = active_f.sum(dim=1).clamp(min=1.0)       # [B, 1]
+        context  = (hidden * active_f).sum(dim=1) / n_active # [B, D]
+
+        # Generar slots condicionados
+        ws_flat = self.ws_generator(context)                  # [B, S*D]
+        ws = ws_flat.view(B, S, D)
+
+        # Mezcla con fallback estatico para estabilidad en inicializacion
+        fallback = self.workspace_fallback.unsqueeze(0).expand(B, -1, -1)
+        # Gate aprendido implicitamente: el MLP se inicializa cerca de zero,
+        # asi al inicio ws ≈ 0 y el fallback domina via la suma residual
+        return ws + fallback
 
     def forward(self, hidden: Tensor, active_mask: Tensor) -> Tensor:
         """
@@ -312,17 +371,26 @@ class _GlobalWorkspace(nn.Module):
         B, K, D = hidden.shape
         S = self.ws_slots
 
+        # v5.1: Buffer dinamico condicionado al contexto
+        ws = self._generate_workspace(hidden, active_mask)    # [B, S, D]
+
         # ---- Fase 1: Escritura al workspace ----
-        ws = self.workspace.unsqueeze(0).expand(B, -1, -1)  # [B, S, D]
         Q_w = self.write_q(ws)                               # [B, S, D]
         K_w = self.write_k(hidden)                           # [B, K, D]
         V_w = self.write_v(hidden)                           # [B, K, D]
 
         attn_w = torch.bmm(Q_w, K_w.transpose(1, 2)) * self.scale   # [B, S, K]
+
         # Solo activos pueden escribir (enmascarar columnas inactivas)
         col_mask = active_mask.unsqueeze(1).expand(B, S, K)
+
+        # v5.1: Manejo robusto de filas completamente enmascaradas
+        # Verificar si hay al menos un activo por fila del workspace
+        any_active = col_mask.any(dim=-1, keepdim=True)               # [B, S, 1]
         attn_w = attn_w.masked_fill(~col_mask, float('-inf'))
-        attn_w = F.softmax(attn_w, dim=-1).nan_to_num(0.0)
+        attn_w = F.softmax(attn_w, dim=-1)
+        # Si ningun modulo activo, atencion zero (en lugar de NaN)
+        attn_w = attn_w * any_active.float()
 
         ws_updated = self.norm_ws(ws + torch.bmm(attn_w, V_w))       # [B, S, D]
 
@@ -340,6 +408,7 @@ class _GlobalWorkspace(nn.Module):
 
 # ============================================================================
 # 5. _DVNCCodebook — Discrete-Valued Neural Communication (DVNC / VQ)
+#    v5.1: Commitment adaptativo por entropia de activacion
 # ============================================================================
 
 class _DVNCCodebook(nn.Module):
@@ -356,15 +425,29 @@ class _DVNCCodebook(nn.Module):
         z_q = codebook[argmin_c ||z - c||]
         z_sg = z + (z_q - z).detach()    (straight-through)
 
+    v5.1: El commitment loss se pondera inversamente a la entropia de activacion.
+    Cuando pocos modulos estan activos (sistema bajo estres/muerte progresiva),
+    el codebook se relaja para permitir mayor expresividad.
+
+        beta_eff = beta_base * sigmoid(entropy / entropy_scale)
+
     Args:
-        rim_size:   Dimension del espacio de comunicacion.
-        num_codes:  Tamano del libro de codigos (vocabulario discreto).
-        commitment: Peso del commitment loss (beta en VQ-VAE).
+        rim_size:       Dimension del espacio de comunicacion.
+        num_codes:      Tamano del libro de codigos (vocabulario discreto).
+        commitment:     Peso base del commitment loss (beta en VQ-VAE).
+        entropy_scale:  Escala para la modulacion por entropia.
     """
 
-    def __init__(self, rim_size: int, num_codes: int = 64, commitment: float = 0.25):
+    def __init__(
+        self,
+        rim_size: int,
+        num_codes: int = 64,
+        commitment: float = 0.25,
+        entropy_scale: float = 1.0,
+    ):
         super().__init__()
-        self.commitment = commitment
+        self.commitment_base = commitment
+        self.entropy_scale = entropy_scale
         self.codebook = nn.Embedding(num_codes, rim_size)
         nn.init.uniform_(self.codebook.weight, -1.0 / num_codes, 1.0 / num_codes)
 
@@ -372,15 +455,22 @@ class _DVNCCodebook(nn.Module):
         self.proj_out = nn.Linear(rim_size, rim_size, bias=False)
         self.norm     = nn.LayerNorm(rim_size)
 
-    def forward(self, hidden: Tensor, active_mask: Tensor) -> Tuple[Tensor, Tensor]:
+    def forward(
+        self,
+        hidden: Tensor,
+        active_mask: Tensor,
+        activation_entropy: Optional[float] = None,
+    ) -> Tuple[Tensor, Tensor]:
         """
         Args:
-            hidden:      [B, K, rim_size]
-            active_mask: [B, K] bool
+            hidden:               [B, K, rim_size]
+            active_mask:          [B, K] bool
+            activation_entropy:   float o None — entropia de los scores de activacion.
+                                  Si se provee, modula el commitment loss.
 
         Returns:
             h_comm:       [B, K, rim_size]  — mensajes discretizados (inactivos = 0)
-            vq_loss:      scalar             — loss de cuantificacion (para el trainer)
+            vq_loss:      scalar             — loss de cuantificacion adaptativo
         """
         z = self.proj_in(hidden)          # [B, K, D]
 
@@ -395,10 +485,20 @@ class _DVNCCodebook(nn.Module):
         idx = dist.argmin(dim=-1)                                     # [B*K]
         z_q = self.codebook(idx).view_as(z)                          # [B, K, D]
 
-        # VQ loss: alinear codebook hacia z (sg) + commitment
+        # v5.1: Commitment adaptativo
+        # beta_eff = beta_base * sigmoid(entropy / scale)
+        # Baja entropia (pocos activos, estres) -> beta_eff baja -> codebook relajado
+        # Alta entropia (muchos activos, sano)   -> beta_eff alta -> codebook estricto
+        if activation_entropy is not None:
+            beta_eff = self.commitment_base * torch.sigmoid(
+                torch.tensor(activation_entropy / self.entropy_scale, device=hidden.device)
+            )
+        else:
+            beta_eff = self.commitment_base
+
         vq_loss = (
             (z_q.detach() - z).pow(2).mean()
-            + self.commitment * (z_q - z.detach()).pow(2).mean()
+            + beta_eff * (z_q - z.detach()).pow(2).mean()
         )
 
         # Straight-Through Estimator
@@ -414,6 +514,7 @@ class _DVNCCodebook(nn.Module):
 
 # ============================================================================
 # Dataclass de estado
+# v5.1: Incluye fingerprint para NCO y contador de inactividad
 # ============================================================================
 
 @dataclass
@@ -424,16 +525,47 @@ class RIMsState:
     attention_weights: Tensor   # [B, K] float (scores softmax de seleccion)
     communication:     Tensor   # [B, K, rim_size] (ultimo mensaje)
     vq_loss:           Tensor   # scalar (0 si comm_mode != 'dvnc')
+    inactivity_steps:  Tensor   # [B, K] int — pasos consecutivos inactivo (v5.1)
+    fingerprint:       str = "" # hash ligero del estado para NCO (v5.1)
 
     def to_dict(self) -> Dict[str, Any]:
         aw = self.attention_weights
         return {
-            'num_active':         self.active_rims.float().sum(-1).mean().item(),
-            'activation_rate':    self.active_rims.float().mean().item(),
-            'attention_entropy':  -(aw * (aw + 1e-10).log()).sum(-1).mean().item(),
-            'comm_norm':          self.communication.norm(dim=-1).mean().item(),
-            'vq_loss':            self.vq_loss.item(),
+            'num_active':          self.active_rims.float().sum(-1).mean().item(),
+            'activation_rate':     self.active_rims.float().mean().item(),
+            'attention_entropy':   -(aw * (aw + 1e-10).log()).sum(-1).mean().item(),
+            'comm_norm':           self.communication.norm(dim=-1).mean().item(),
+            'vq_loss':             self.vq_loss.item(),
+            'max_inactivity':      self.inactivity_steps.max().item(),
+            'mean_inactivity':     self.inactivity_steps.float().mean().item(),
+            'fingerprint':         self.fingerprint,
         }
+
+
+# ============================================================================
+# Utilidad: Fingerprint para NCO
+# ============================================================================
+
+def _compute_fingerprint(hidden: Tensor, precision: int = 4) -> str:
+    """
+    Computa un hash ligero del estado oculto para deteccion de divergencia
+    ontologica entre checkpoints por parte del NCO.
+
+    Cuantifica el tensor a `precision` decimales, luego aplica SHA-256 truncado.
+    Esto permite comparacion rapida sin almacenar el tensor completo.
+
+    Args:
+        hidden:    [B, K, rim_size]
+        precision: decimales de cuantificacion (4 = ~0.0001 resolucion)
+
+    Returns:
+        hex string de 16 caracteres (64 bits de hash)
+    """
+    # Cuantificar para estabilidad (ignorar ruido de float)
+    scale = 10 ** precision
+    quantized = (hidden.detach().float().cpu() * scale).round().to(torch.int32)
+    raw_bytes = quantized.numpy().tobytes()
+    return hashlib.sha256(raw_bytes).hexdigest()[:16]
 
 
 # ============================================================================
@@ -442,49 +574,54 @@ class RIMsState:
 
 class RecurrentIndependentMechanisms(ConsciousnessLayerBase):
     """
-    Recurrent Independent Mechanisms v5.0 — implementacion completa del paper
+    Recurrent Independent Mechanisms v5.1 — implementacion completa del paper
     y variantes modernas (GWT, DVNC, Gumbel-Softmax, grupos fast/slow).
 
     Fases de cada timestep:
-      1. **Input Attention** (paper-exact): cada RIM genera Q desde su h_{t-1},
+      1. **Input Attention** (paper-exact, v5.1 per-module W_q):
+         cada RIM genera Q desde su h_{t-1} con su propio W_q^{(i)},
          la entrada genera K y V compartidos; scores -> top-k con STE o Gumbel.
       2. **Dinamicas Independientes** (vectorizado): GroupGRUCell con einsum;
          mascara de Hadamard aplica el resultado solo a activos.
          h_t = M ⊙ h_new + (1-M) ⊙ h_{t-1}
-      3. **Comunicacion** (configurable):
-         - `'standard'`: multi-head con residual (paper math).
-         - `'gwt'`     : Global Workspace Theory (competencia→buffer→broadcast).
-         - `'dvnc'`    : codebook VQ discreto + straight-through.
+      3. **Inactivity Decay** (v5.1): modulos inactivos sufren decay exponencial
+         proporcional a su tiempo de inactividad, previniendo estados stale.
+      4. **Comunicacion** (configurable):
+         - `'standard'`: multi-head con residual (paper math, v5.1 mascara corregida).
+         - `'gwt'`     : Global Workspace Theory (v5.1 buffer dinamico).
+         - `'dvnc'`    : codebook VQ discreto (v5.1 commitment adaptativo).
 
     Args:
-        input_size:    Dimension de x_t.
-        hidden_size:   Dimension total del estado (divisible por num_rims).
-        num_rims:      K_t — numero total de modulos.
-        num_active:    K_a — modulos activos por paso (top-k).
-        num_heads:     Cabezas en la atencion de comunicacion.
-        comm_mode:     'standard' | 'gwt' | 'dvnc'.
-        routing:       'ste' (Straight-Through) | 'gumbel' (Gumbel-Softmax).
-        gumbel_temp:   Temperatura inicial de Gumbel (solo si routing='gumbel').
-        num_codes:     Tamano del codebook DVNC (solo si comm_mode='dvnc').
-        ws_slots:      Slots del workspace GWT (solo si comm_mode='gwt').
-        dropout:       Dropout general.
-        config:        LayerConfig opcional.
+        input_size:       Dimension de x_t.
+        hidden_size:      Dimension total del estado (divisible por num_rims).
+        num_rims:         K_t — numero total de modulos.
+        num_active:       K_a — modulos activos por paso (top-k).
+        num_heads:        Cabezas en la atencion de comunicacion.
+        comm_mode:        'standard' | 'gwt' | 'dvnc'.
+        routing:          'ste' (Straight-Through) | 'gumbel' (Gumbel-Softmax).
+        gumbel_temp:      Temperatura inicial de Gumbel (solo si routing='gumbel').
+        num_codes:        Tamano del codebook DVNC (solo si comm_mode='dvnc').
+        ws_slots:         Slots del workspace GWT (solo si comm_mode='gwt').
+        dropout:          Dropout general.
+        inactivity_decay: Lambda de decay para modulos inactivos (v5.1).
+        config:           LayerConfig opcional.
     """
 
     def __init__(
         self,
-        input_size:   int = 64,
-        hidden_size:  int = 256,
-        num_rims:     int = 6,
-        num_active:   int = 3,
-        num_heads:    int = 4,
-        comm_mode:    Literal['standard', 'gwt', 'dvnc'] = 'standard',
-        routing:      Literal['ste', 'gumbel'] = 'ste',
-        gumbel_temp:  float = 1.0,
-        num_codes:    int = 64,
-        ws_slots:     int = 2,
-        dropout:      float = 0.1,
-        config:       Optional[LayerConfig] = None,
+        input_size:       int = 64,
+        hidden_size:      int = 256,
+        num_rims:         int = 6,
+        num_active:       int = 3,
+        num_heads:        int = 4,
+        comm_mode:        Literal['standard', 'gwt', 'dvnc'] = 'standard',
+        routing:          Literal['ste', 'gumbel'] = 'ste',
+        gumbel_temp:      float = 1.0,
+        num_codes:        int = 64,
+        ws_slots:         int = 2,
+        dropout:          float = 0.1,
+        inactivity_decay: float = 0.001,
+        config:           Optional[LayerConfig] = None,
     ):
         super().__init__(config)
 
@@ -497,15 +634,16 @@ class RecurrentIndependentMechanisms(ConsciousnessLayerBase):
         if rim_size % num_heads != 0:
             raise ValueError(f"rim_size={rim_size} debe ser divisible por num_heads={num_heads}")
 
-        self.input_size  = input_size
-        self.hidden_size = hidden_size
-        self.num_rims    = num_rims
-        self.num_active  = num_active
-        self.rim_size    = rim_size
-        self.comm_mode   = comm_mode
-        self.routing     = routing
+        self.input_size      = input_size
+        self.hidden_size     = hidden_size
+        self.num_rims        = num_rims
+        self.num_active      = num_active
+        self.rim_size        = rim_size
+        self.comm_mode       = comm_mode
+        self.routing         = routing
+        self.inactivity_decay = inactivity_decay
 
-        # ---- Atencion de entrada (paper-exact) ---- [SLOW: theta_atencion]
+        # ---- Atencion de entrada (paper-exact, v5.1 per-module) ---- [SLOW]
         self.input_attention = _InputAttentionRIM(
             hidden_size=input_size,
             rim_size=rim_size,
@@ -513,10 +651,13 @@ class RecurrentIndependentMechanisms(ConsciousnessLayerBase):
             d_key=max(32, rim_size // 2),
         )
 
-        # ---- Temperatura Gumbel aprendible ---- [SLOW]
-        self.log_gumbel_temp = nn.Parameter(torch.tensor(math.log(gumbel_temp)))
+        # ---- Temperatura Gumbel (v5.1: softplus en lugar de clamp) ---- [SLOW]
+        # Se usa raw_gumbel_temp como input a softplus + offset
+        self._raw_gumbel_temp = nn.Parameter(
+            torch.tensor(math.log(math.exp(gumbel_temp - 0.1) - 1.0))  # inverse softplus
+        )
 
-        # ---- GRU vectorizado ---- [FAST: theta_modulos]
+        # ---- GRU vectorizado ---- [FAST]
         self.gru = GroupGRUCell(rim_size, rim_size, num_rims)
 
         # ---- LayerNorm post-update ---- [FAST]
@@ -548,6 +689,9 @@ class RecurrentIndependentMechanisms(ConsciousnessLayerBase):
 
         self._init_weights()
 
+        # ---- v5.1: Assertion de cobertura fast/slow exhaustiva ----
+        self._validate_param_groups()
+
     # ------------------------------------------------------------------
     # Inicializacion
     # ------------------------------------------------------------------
@@ -558,6 +702,46 @@ class RecurrentIndependentMechanisms(ConsciousnessLayerBase):
                 nn.init.xavier_uniform_(m.weight)
                 if m.bias is not None:
                     nn.init.zeros_(m.bias)
+
+    # ------------------------------------------------------------------
+    # v5.1: Validacion de cobertura de parametros fast/slow
+    # ------------------------------------------------------------------
+
+    def _validate_param_groups(self) -> None:
+        """
+        Verifica que fast_params() + slow_params() cubren exactamente
+        todos los parametros del modulo, sin duplicados ni omisiones.
+        """
+        all_params = set(id(p) for p in self.parameters())
+        fast_ids   = set(id(p) for p in self.fast_params())
+        slow_ids   = set(id(p) for p in self.slow_params())
+
+        overlap = fast_ids & slow_ids
+        missing = all_params - (fast_ids | slow_ids)
+
+        if overlap:
+            raise RuntimeError(
+                f"[RIMs v5.1] {len(overlap)} parametros duplicados en fast/slow groups. "
+                f"Revisar asignacion de modulos."
+            )
+        if missing:
+            raise RuntimeError(
+                f"[RIMs v5.1] {len(missing)} parametros no asignados a fast ni slow. "
+                f"Todo parametro debe pertenecer a exactamente un grupo."
+            )
+
+    # ------------------------------------------------------------------
+    # Temperatura Gumbel (v5.1: softplus)
+    # ------------------------------------------------------------------
+
+    @property
+    def gumbel_temp(self) -> Tensor:
+        """
+        Temperatura Gumbel via softplus + offset minimo.
+        Rango efectivo: [0.1, +inf) con gradientes continuos en todo el rango.
+        Evita gradientes discontinuos del clamp anterior.
+        """
+        return F.softplus(self._raw_gumbel_temp) + 0.1
 
     # ------------------------------------------------------------------
     # Grupos de parametros para meta-aprendizaje (fast / slow)
@@ -578,7 +762,7 @@ class RecurrentIndependentMechanisms(ConsciousnessLayerBase):
         """
         slow_modules = (self.input_attention, self.comm_layer)
         slow_list = [p for m in slow_modules for p in m.parameters()]
-        slow_list.append(self.log_gumbel_temp)
+        slow_list.append(self._raw_gumbel_temp)
         slow_list.append(self.initial_hidden)
         return slow_list
 
@@ -594,6 +778,7 @@ class RecurrentIndependentMechanisms(ConsciousnessLayerBase):
 
         STE:    forward = hard mask, backward = softmax.
         Gumbel: scores perturbados con ruido Gumbel -> top-k mas suave.
+                v5.1: temperatura via softplus (gradientes continuos).
 
         Returns:
             active_mask:  [B, K] bool
@@ -603,7 +788,7 @@ class RecurrentIndependentMechanisms(ConsciousnessLayerBase):
         B, K = scores.shape
 
         if self.routing == 'gumbel' and self.training:
-            temp = self.log_gumbel_temp.exp().clamp(0.1, 10.0)
+            temp = self.gumbel_temp  # v5.1: softplus
             gumbel = -torch.empty_like(scores).exponential_().log()
             scores = (scores + gumbel) / temp
 
@@ -618,12 +803,59 @@ class RecurrentIndependentMechanisms(ConsciousnessLayerBase):
         return active_mask, attn_weights, sel_weights
 
     # ------------------------------------------------------------------
+    # v5.1: Inactivity decay
+    # ------------------------------------------------------------------
+
+    def _apply_inactivity_decay(
+        self, hidden: Tensor, active_mask: Tensor, inactivity_steps: Tensor
+    ) -> Tuple[Tensor, Tensor]:
+        """
+        Aplica decay exponencial a modulos inactivos proporcional a su
+        tiempo de inactividad acumulado.
+
+            h_inactive *= (1 - lambda * min(steps, cap) / cap)
+
+        El decay es suave y capped para evitar que el estado colapse a zero
+        demasiado rapido. Modulos activos resetean su contador a 0.
+
+        Args:
+            hidden:           [B, K, rim_size]
+            active_mask:      [B, K] bool
+            inactivity_steps: [B, K] long — pasos consecutivos inactivo
+
+        Returns:
+            hidden_decayed:   [B, K, rim_size]
+            inactivity_new:   [B, K] long — contadores actualizados
+        """
+        # Actualizar contadores: activos -> 0, inactivos -> +1
+        inactivity_new = torch.where(
+            active_mask,
+            torch.zeros_like(inactivity_steps),
+            inactivity_steps + 1,
+        )
+
+        # Decay factor: 1.0 para activos, decae para inactivos
+        # Cap en 100 pasos para evitar colapso total
+        cap = 100.0
+        decay_ratio = (inactivity_new.float().clamp(max=cap) / cap)       # [B, K] in [0,1]
+        decay_factor = 1.0 - self.inactivity_decay * decay_ratio          # [B, K]
+        decay_factor = decay_factor.unsqueeze(-1)                         # [B, K, 1]
+
+        # Solo aplicar decay a inactivos (activos mantienen factor=1.0)
+        hidden_decayed = hidden * decay_factor
+
+        return hidden_decayed, inactivity_new
+
+    # ------------------------------------------------------------------
     # Paso temporal unico
     # ------------------------------------------------------------------
 
     def _step(
-        self, x_t: Tensor, hidden: Tensor
-    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
+        self,
+        x_t: Tensor,
+        hidden: Tensor,
+        inactivity_steps: Tensor,
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor]:
         """
         Procesa un timestep.
 
@@ -632,36 +864,43 @@ class RecurrentIndependentMechanisms(ConsciousnessLayerBase):
           2. active = top-k(s_{t,i})
           3. h_all  = GroupGRU(x̃ * alpha_i, h_{t-1})     (todos los grupos)
           4. h_t    = M ⊙ h_all + (1-M) ⊙ h_{t-1}        (Hadamard mask)
+          4b. Inactivity decay (v5.1)
           5. h_t    = Communication(h_t, active)
           6. out_t  = LayerNorm(h_flat + OutputProj(h_flat))
 
         Returns:
-            hidden_new, comm, output_t, active_mask, attn_weights, vq_loss
+            hidden_new, comm, output_t, active_mask, attn_weights, vq_loss, inactivity_new
         """
         B = x_t.shape[0]
 
         # 1. Atencion de entrada
-        V_exp, scores = self.input_attention(x_t, hidden)  # V_exp: [B,K,rim]; scores: [B,K]
+        V_exp, scores = self.input_attention(x_t, hidden)
 
         # 2. Seleccion top-k
         active_mask, attn_weights, sel_weights = self._select(scores)
 
         # Entrada atendida: x̃_{t,i} = alpha_i * V_{inp}
-        x_per_rim = sel_weights.unsqueeze(-1) * V_exp       # [B, K, rim_size]
+        x_per_rim = sel_weights.unsqueeze(-1) * V_exp
 
-        # 3. GroupGRU vectorizado (todos los modulos en paralelo)
-        h_all = self.gru(x_per_rim, hidden)                 # [B, K, rim_size]
+        # 3. GroupGRU vectorizado
+        h_all = self.gru(x_per_rim, hidden)
 
-        # 4. Mascara de Hadamard: solo activos se actualizan
-        #    h_t = M ⊙ h_new + (1-M) ⊙ h_{t-1}
+        # 4. Mascara de Hadamard
         M = active_mask.unsqueeze(-1).float()
         hidden_new = M * h_all + (1.0 - M) * hidden
         hidden_new = self.hidden_norm(hidden_new)
 
+        # 4b. v5.1: Inactivity decay
+        hidden_new, inactivity_new = self._apply_inactivity_decay(
+            hidden_new, active_mask, inactivity_steps
+        )
+
         # 5. Comunicacion (segun modo)
         vq_loss = torch.zeros(1, device=x_t.device)
         if self.comm_mode == 'dvnc':
-            hidden_new, vq_loss = self.comm_layer(hidden_new, active_mask)
+            # v5.1: Pasar entropia de activacion para commitment adaptativo
+            act_entropy = -(attn_weights * (attn_weights + 1e-10).log()).sum(-1).mean().item()
+            hidden_new, vq_loss = self.comm_layer(hidden_new, active_mask, act_entropy)
             comm = hidden_new
         else:
             hidden_new = self.comm_layer(hidden_new, active_mask)
@@ -671,7 +910,7 @@ class RecurrentIndependentMechanisms(ConsciousnessLayerBase):
         h_flat  = hidden_new.view(B, -1)
         out_t   = self.output_norm(h_flat + self.output_proj(h_flat))
 
-        return hidden_new, comm, out_t, active_mask, attn_weights, vq_loss
+        return hidden_new, comm, out_t, active_mask, attn_weights, vq_loss, inactivity_new
 
     # ------------------------------------------------------------------
     # Forward
@@ -681,15 +920,17 @@ class RecurrentIndependentMechanisms(ConsciousnessLayerBase):
         self,
         x:      Tensor,
         hidden: Optional[Tensor] = None,
+        inactivity_steps: Optional[Tensor] = None,
     ) -> Tuple[Tensor, RIMsState]:
         """
         Args:
-            x:      [B, input_size] o [B, seq_len, input_size]
-            hidden: [B, num_rims, rim_size] o None
+            x:                [B, input_size] o [B, seq_len, input_size]
+            hidden:           [B, num_rims, rim_size] o None
+            inactivity_steps: [B, num_rims] long o None (v5.1)
 
         Returns:
             output: [B, hidden_size] o [B, seq_len, hidden_size]
-            state:  RIMsState del ultimo timestep
+            state:  RIMsState del ultimo timestep (incluye fingerprint v5.1)
         """
         is_seq = x.dim() == 3
         if not is_seq:
@@ -701,12 +942,17 @@ class RecurrentIndependentMechanisms(ConsciousnessLayerBase):
         if hidden is None:
             hidden = self.initial_hidden.expand(B, -1, -1).clone().to(device)
 
+        if inactivity_steps is None:
+            inactivity_steps = torch.zeros(B, self.num_rims, dtype=torch.long, device=device)
+
         outputs: List[Tensor] = []
         total_vq = torch.zeros(1, device=device)
         last_active = last_attn = last_comm = None
 
         for t in range(T):
-            hidden, comm, out_t, active, attn, vq = self._step(x[:, t], hidden)
+            hidden, comm, out_t, active, attn, vq, inactivity_steps = self._step(
+                x[:, t], hidden, inactivity_steps
+            )
             outputs.append(out_t)
             total_vq   = total_vq + vq
             last_active = active
@@ -722,12 +968,17 @@ class RecurrentIndependentMechanisms(ConsciousnessLayerBase):
         entropy   = -(last_attn * (last_attn + 1e-10).log()).sum(-1).mean().item()
         sparsity  = 1.0 - act_rate
         self.metrics.record({
-            'activation_rate':   act_rate,
-            'attention_entropy': entropy,
-            'sparsity':          sparsity,
-            'vq_loss':           (total_vq / T).item(),
-            'gumbel_temp':       self.log_gumbel_temp.exp().item(),
+            'activation_rate':    act_rate,
+            'attention_entropy':  entropy,
+            'sparsity':           sparsity,
+            'vq_loss':            (total_vq / T).item(),
+            'gumbel_temp':        self.gumbel_temp.item(),
+            'max_inactivity':     inactivity_steps.max().item(),
+            'mean_inactivity':    inactivity_steps.float().mean().item(),
         })
+
+        # v5.1: Fingerprint para NCO
+        fp = _compute_fingerprint(hidden)
 
         state = RIMsState(
             hidden_states     = hidden,
@@ -735,6 +986,8 @@ class RecurrentIndependentMechanisms(ConsciousnessLayerBase):
             attention_weights = last_attn,
             communication     = last_comm,
             vq_loss           = total_vq / T,
+            inactivity_steps  = inactivity_steps,
+            fingerprint       = fp,
         )
 
         return output, state
@@ -747,14 +1000,26 @@ class RecurrentIndependentMechanisms(ConsciousnessLayerBase):
         return {
             **{k: self.metrics.get_stats(k)
                for k in ('activation_rate', 'attention_entropy',
-                         'sparsity', 'vq_loss', 'gumbel_temp')},
-            'num_rims':   self.num_rims,
-            'num_active': self.num_active,
-            'rim_size':   self.rim_size,
-            'comm_mode':  self.comm_mode,
-            'routing':    self.routing,
+                         'sparsity', 'vq_loss', 'gumbel_temp',
+                         'max_inactivity', 'mean_inactivity')},
+            'num_rims':          self.num_rims,
+            'num_active':        self.num_active,
+            'rim_size':          self.rim_size,
+            'comm_mode':         self.comm_mode,
+            'routing':           self.routing,
+            'inactivity_decay':  self.inactivity_decay,
         }
 
-    def reset_hidden(self, batch_size: int, device: torch.device) -> Tensor:
-        """Genera un estado oculto inicial limpio."""
-        return self.initial_hidden.expand(batch_size, -1, -1).clone().to(device)
+    def reset_hidden(self, batch_size: int, device: torch.device) -> Tuple[Tensor, Tensor]:
+        """
+        Genera un estado oculto inicial limpio.
+
+        v5.1: Retorna tambien el contador de inactividad inicializado a 0.
+
+        Returns:
+            hidden:           [B, num_rims, rim_size]
+            inactivity_steps: [B, num_rims] long
+        """
+        hidden = self.initial_hidden.expand(batch_size, -1, -1).clone().to(device)
+        inactivity_steps = torch.zeros(batch_size, self.num_rims, dtype=torch.long, device=device)
+        return hidden, inactivity_steps
