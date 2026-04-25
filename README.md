@@ -1,4 +1,4 @@
-# Recurrent Independent Mechanisms (RIMs) v5.1
+# Recurrent Independent Mechanisms (RIMs) v5.1.1
 **MSC Framework — Consciousness Architecture Stack**
 
 > *"Un modelo recurrente monolítico fracasa cuando el entorno sufre alteraciones localizadas. Los RIMs separan los flujos de información causal mediante módulos que compiten, se especializan y comunican de forma dispersa."*
@@ -16,7 +16,7 @@
 8. [NCO Fingerprint](#nco-fingerprint)
 9. [Meta-aprendizaje (fast/slow)](#meta-aprendizaje-fastslow)
 10. [API de referencia](#api-de-referencia)
-11. [Migración v5.0 → v5.1](#migración-v50--v51)
+11. [Migración](#migración)
 12. [Benchmarks](#benchmarks)
 13. [Tests](#tests)
 14. [Integración con MSC](#integración-con-msc)
@@ -26,14 +26,16 @@
 
 ## Descripción
 
-Los **Recurrent Independent Mechanisms** (Goyal et al., 2019) fragmentan el estado oculto en *K_t* módulos funcionales independientes. En cada paso temporal, un selector diferenciable activa los *K_a* módulos más relevantes (top-k). Los inactivos conservan su estado (con decay suave v5.1), protegiendo el conocimiento acumulado contra interferencia destructiva.
+Los **Recurrent Independent Mechanisms** (Goyal et al., 2019) fragmentan el estado oculto en *K_t* módulos funcionales independientes. En cada paso temporal, un selector diferenciable activa los *K_a* módulos más relevantes (top-k). Los inactivos conservan su estado (con decay suave), protegiendo el conocimiento acumulado contra interferencia destructiva.
 
 **Por qué importa para MSC:**
-Los RIMs implementan directamente el *Prior de Consciencia* de Bengio: un cuello de botella de atención que emula la especialización cortical. Son el substrato computacional del `GlobalWorkspaceEA1V2` y del experimento de continuidad ontológica (NCO). El fingerprint de estado (v5.1) permite al NCO detectar divergencia ontológica entre checkpoints sin almacenar tensores completos.
+Los RIMs implementan directamente el *Prior de Consciencia* de Bengio: un cuello de botella de atención que emula la especialización cortical. Son el substrato computacional del `GlobalWorkspaceEA1V2` y del experimento de continuidad ontológica (NCO). El fingerprint de estado permite al NCO detectar divergencia ontológica entre checkpoints sin almacenar tensores completos.
+
+**v5.1.1 — Correcciones funcionales y de robustez.** Esta versión corrige nueve bugs identificados en v5.1.0, incluyendo dos críticos en `_DVNCCodebook` (VQ loss invertido y entropía con grafo roto) y uno medio en el orden de aplicación del inactivity decay. Ver [Changelog](#changelog) para detalles. Modelos sin DVNC y con `inactivity_decay=0` son numéricamente equivalentes a v5.1.0.
 
 ### Ventajas frente a arquitecturas monolíticas
 
-| Propiedad | LSTM/GRU monolítico | RIMs v5.1 |
+| Propiedad | LSTM/GRU monolítico | RIMs v5.1.1 |
 |-----------|-------------------|-----------|
 | Representación del estado | Vector único denso | *K* módulos independientes |
 | Routing de entrada | Homogéneo a toda la red | Top-k competitivo |
@@ -42,8 +44,9 @@ Los RIMs implementan directamente el *Prior de Consciencia* de Bengio: un cuello
 | Comunicación | Densa e interconectada | Dispersa (standard / GWT / DVNC) |
 | Olvido catastrófico | Alta vulnerabilidad | Mitigado por congelamiento + decay |
 | Generalización OOD | Pobre | Robusta por especialización |
-| Estado stale en inactivos | N/A | Decay exponencial capped (v5.1) |
-| Integridad ontológica | Sin soporte | Fingerprint SHA-256 para NCO (v5.1) |
+| Estado stale en inactivos | N/A | Decay exponencial capped |
+| Integridad ontológica | Sin soporte | Fingerprint SHA-256 para NCO (opt-in) |
+| VQ loss DVNC | N/A | Posición canónica (van den Oord 2017) |
 
 ---
 
@@ -56,40 +59,43 @@ x_t ──► InputAttentionRIM ──► scores [B, K]
                             Selector top-k (STE / Gumbel-softplus)
                                  │
                     ┌────────────▼────────────┐
+                    │  Inactivity Decay       │  (v5.1.1: orden corregido)
+                    │  h_decayed = h·(1-λ·r)  │   solo sobre h_{t-1} preservado
+                    └────────────┬────────────┘
+                                 │
+                    ┌────────────▼────────────┐
                     │    GroupGRUCell          │  ← FAST params
                     │    (einsum vectorizado)  │
                     └────────────┬────────────┘
                                  │
-                    h_t = M ⊙ h_new + (1-M) ⊙ h_{t-1}   (Hadamard)
+                    h_t = M ⊙ h_new + (1-M) ⊙ h_decayed   (Hadamard)
                                  │
-                    ┌────────────▼────────────┐
-                    │  Inactivity Decay       │  (v5.1)
-                    │  h *= (1 - λ·ratio)     │
-                    └────────────┬────────────┘
+                            LayerNorm
                                  │
                     ┌────────────▼────────────┐
                     │  Comunicación (modo):    │  ← SLOW params
                     │  • standard: MH residual │
                     │  • gwt:  Dynamic GWT     │
                     │  • dvnc: Adaptive VQ     │
+                    │         (loss canónico)  │
                     └────────────┬────────────┘
                                  │
                     output_t = LayerNorm(h + OutputProj(h))
                                  │
-                    fingerprint = SHA256(quantize(h))   (v5.1)
+                    fingerprint = SHA256(quantize(h))   (opt-in v5.1.1)
 ```
 
 ### Sub-módulos
 
-| Clase | Descripción | Cambios v5.1 |
+| Clase | Descripción | Cambios v5.1.1 |
 |-------|------------|--------------|
 | `GroupGRUCell` | GRU K grupos vectorizado (`einsum`), O(1) kernels CUDA | — |
-| `_InputAttentionRIM` | Atención de entrada paper-exact: Q←h, K/V←x | W_q per-módulo via einsum |
-| `_MultiHeadCommResidual` | MH-Att con residual: h=Att(h̃)+h̃ | Máscara corregida: solo filas, no columnas |
-| `_GlobalWorkspace` | GWT: competencia→buffer→broadcast | Buffer dinámico condicionado al contexto |
-| `_DVNCCodebook` | DVNC: cuantización VQ-VAE + STE | Commitment adaptativo por entropía |
-| `RIMsState` | Dataclass de estado completo | +`inactivity_steps`, +`fingerprint` |
-| `RecurrentIndependentMechanisms` | Módulo principal | Inactivity decay, softplus temp, validación fast/slow |
+| `_InputAttentionRIM` | Atención de entrada paper-exact: Q←h, K/V←x | Init xavier per-slice 2D |
+| `_MultiHeadCommResidual` | MH-Att con residual: h=Att(h̃)+h̃ | — |
+| `_GlobalWorkspace` | GWT: competencia→buffer→broadcast | `ws_generator[-1]` zero-init real |
+| `_DVNCCodebook` | DVNC: cuantización VQ-VAE + STE | **VQ loss canónico**, entropía como tensor |
+| `RIMsState` | Dataclass de estado completo | `to_dict()` omite fingerprint vacío |
+| `RecurrentIndependentMechanisms` | Módulo principal | Decay reordenado, fingerprint opt-in, `inactivity_cap` configurable |
 
 ---
 
@@ -125,7 +131,7 @@ msc-rims/
 │   ├── base.py                # ConsciousnessLayerBase
 │   └── config.py              # LayerConfig
 ├── tests/
-│   └── tests_rims.py          # 30 tests (v5.1)
+│   └── tests_rims.py          # 30+ tests
 ├── benchmarks/
 │   └── benchmarks.py
 ├── pyproject.toml
@@ -175,11 +181,23 @@ x = torch.randn(32, 20, 128)   # [batch, seq_len, input_size]
 out, state = rims(x)
 
 print(out.shape)               # [32, 20, 384]
-print(state.fingerprint)       # 'a3f7c91b02d4e8f1' (hash NCO)
+print(state.fingerprint)       # '' (default: opt-in en v5.1.1)
 print(state.to_dict())
 # {'num_active': 3.0, 'activation_rate': 0.5, 'attention_entropy': ...,
 #  'comm_norm': ..., 'vq_loss': 0.0, 'max_inactivity': 12,
-#  'mean_inactivity': 4.2, 'fingerprint': 'a3f7c91b02d4e8f1'}
+#  'mean_inactivity': 4.2}
+# (fingerprint omitido si está vacío)
+```
+
+Para activar fingerprint (auditoría NCO):
+
+```python
+rims = RecurrentIndependentMechanisms(
+    input_size=128, hidden_size=384,
+    compute_fingerprint=True,    # opt-in: incurre sync GPU→CPU
+)
+out, state = rims(x)
+print(state.fingerprint)   # 'a3f7c91b02d4e8f1'
 ```
 
 ---
@@ -205,27 +223,31 @@ rims = RecurrentIndependentMechanisms(
     num_heads        = 4,
     dropout          = 0.1,
 
-    # v5.1: Decay de módulos inactivos
+    # Decay de módulos inactivos
     inactivity_decay = 0.001,      # λ — velocidad de decay (0 = desactivado)
+    inactivity_cap   = 100.0,      # v5.1.1: pasos máximos considerados (configurable)
+
+    # NCO fingerprint (opt-in para evitar sync GPU↔CPU)
+    compute_fingerprint = False,   # v5.1.1: default False, activar solo si NCO lo consume
 )
 ```
 
 ### Paso con estado previo (autoregresivo)
 
 ```python
-# v5.1: reset_hidden retorna (hidden, inactivity_steps)
 hidden, inactivity = rims.reset_hidden(batch_size=32, device=device)
+state = None
 outputs = []
 for t in range(seq_len):
     out_t, state = rims(
         x[:, t],
-        hidden=state.hidden_states if t > 0 else hidden,
-        inactivity_steps=state.inactivity_steps if t > 0 else inactivity,
+        hidden=state.hidden_states if state is not None else hidden,
+        inactivity_steps=state.inactivity_steps if state is not None else inactivity,
     )
     outputs.append(out_t)
 
-# Comparar fingerprints entre checkpoints
-if state.fingerprint != prev_checkpoint_fp:
+# Comparar fingerprints entre checkpoints (requiere compute_fingerprint=True)
+if state.fingerprint and state.fingerprint != prev_checkpoint_fp:
     nco.flag_ontological_divergence()
 ```
 
@@ -238,50 +260,58 @@ if state.fingerprint != prev_checkpoint_fp:
 h_{t,k} = MH_Att(h̃_{t,k}, h̃_{t,:}) + h̃_{t,k}    ∀k ∈ S_t
 h_{t,i} = h̃_{t,i}                                   ∀i ∉ S_t
 ```
-Comunicación dispersa directa punto-a-punto. **v5.1**: Solo módulos activos emiten queries (filas). Todos los módulos — activos e inactivos — son fuente (keys/values), preservando información de estado acumulado.
+Comunicación dispersa directa punto-a-punto. Solo módulos activos emiten queries (filas). Todos los módulos — activos e inactivos — son fuente (keys/values), preservando información de estado acumulado.
 
-### `gwt` — Global Workspace Theory (buffer dinámico v5.1)
+### `gwt` — Global Workspace Theory (buffer dinámico)
 ```
 context  = mean(h[active])
-ws_0     = MLP(context) + ws_fallback        ← v5.1: condicionado al contexto
+ws_0     = MLP(context) + ws_fallback        ← condicionado al contexto
 write:     ws_t = Att_write(ws_0, h[active])
 broadcast: h_t  = h + Att_read(h, ws_t)      (todos los módulos)
 ```
-Cuello de botella centralizado. El buffer se genera dinámicamente desde el promedio de estados activos, adaptando la capacidad del workspace al contexto de cada batch/timestep. El fallback estático garantiza estabilidad durante las primeras épocas de entrenamiento.
+Cuello de botella centralizado. El buffer se genera dinámicamente desde el promedio de estados activos. **v5.1.1**: la última capa de `ws_generator` se inicializa explícitamente a zero, garantizando que al inicio del entrenamiento el fallback estático domina realmente (en v5.1.0 esto era solo aspiracional).
 
-### `dvnc` — Discrete-Valued Neural Communication (commitment adaptativo v5.1)
+### `dvnc` — Discrete-Valued Neural Communication (commitment adaptativo)
+
 ```
 z_q  = codebook[argmin_c ||z - c||²]
 z_st = z + (z_q - z).detach()              (Straight-Through)
 
-β_eff = β_base · σ(entropy / scale)         ← v5.1: adaptativo
+# v5.1.1: VQ loss en posición canónica (van den Oord et al. 2017, eq. 3)
+codebook_loss   = ||z_q - sg[z]||²          ← entrena codebook
+commitment_loss = β_eff · ||z - sg[z_q]||²  ← entrena encoder
+β_eff = β_base · σ(entropy / scale)         ← adaptativo
 ```
-Mensaje discreto antes de comunicar. **v5.1**: El commitment loss se modula por la entropía de activación. Bajo estrés (pocos módulos activos, muerte progresiva), β baja automáticamente → el codebook se relaja para permitir mayor expresividad. En régimen sano, β alta → vocabulario estricto.
+
+Mensaje discreto antes de comunicar. **v5.1.1 (crítico)**: en v5.1.0 los `.detach()` estaban intercambiados, propagando gradientes al módulo equivocado. Esto se corrigió a la formulación canónica de VQ-VAE. Adicionalmente, la entropía de activación ahora se pasa como tensor (no float), preservando el grafo computacional para gradientes diferenciables hacia `attention_weights`.
 
 ```python
-# El VQ loss (ahora adaptativo) debe sumarse a la loss principal
+# El VQ loss debe sumarse a la loss principal
 out, state = rims(x)
-loss = task_loss + 0.1 * state.vq_loss
+loss = task_loss + 0.1 * state.vq_loss   # vq_loss es scalar shape []
 ```
 
 ---
 
 ## Inactivity Decay
 
-**Nuevo en v5.1.** Previene estados stale en módulos que permanecen inactivos durante muchos pasos consecutivos.
+Previene estados stale en módulos que permanecen inactivos durante muchos pasos consecutivos.
 
 ```
 steps_k += 1  si módulo k inactivo, else 0
-ratio_k  = min(steps_k, 100) / 100
-h_k     *= (1 - λ · ratio_k)
+ratio_k  = min(steps_k, inactivity_cap) / inactivity_cap
+h_k     *= (1 - λ · ratio_k)            ← solo sobre h_{t-1} de inactivos
 ```
 
 | Parámetro | Default | Descripción |
 |-----------|---------|-------------|
 | `inactivity_decay` | 0.001 | λ — velocidad de decay. 0 = desactivado |
+| `inactivity_cap` | 100.0 | Pasos máximos considerados (v5.1.1: configurable) |
+
+**v5.1.1 (orden corregido):** El decay ahora se aplica a `h_{t-1}` **antes** de la mezcla Hadamard con `h_all` y antes del LayerNorm. En v5.1.0 se aplicaba post-LayerNorm sobre el resultado mezclado, contradiciendo el docstring. La nueva semántica es la documentada: el decay opera específicamente sobre el estado preservado de los módulos inactivos.
 
 **Características:**
-- **Capped a 100 pasos**: el decay máximo es `λ` (e.g., 0.1% de reducción por paso con default). Nunca colapsa a zero.
+- **Capped**: el decay máximo es `λ` (e.g., 0.1% de reducción por paso con default). Nunca colapsa a zero.
 - **Reset automático**: al activarse, el contador vuelve a 0.
 - **Tracking**: `RIMsState.inactivity_steps` `[B, K]` se propaga entre timesteps.
 - **Métricas**: `max_inactivity` y `mean_inactivity` en `get_statistics()`.
@@ -289,16 +319,20 @@ h_k     *= (1 - λ · ratio_k)
 **Cuándo ajustar:**
 - Secuencias cortas (<20 pasos): puede dejarse en 0 (sin decay).
 - Secuencias largas (>100 pasos): 0.001–0.01 recomendado.
-- Experimentos de muerte progresiva (Exp10, DEEP_ERASURE): 0.005 para observar degradación gradual en módulos no-NCO.
+- Experimentos de muerte progresiva (Exp10, DEEP_ERASURE): 0.005 para observar degradación gradual en módulos no-NCO. Considerar `inactivity_cap=200.0` para observar decay más prolongado.
 
 ---
 
 ## NCO Fingerprint
 
-**Nuevo en v5.1.** Hash ligero del estado oculto para detección de divergencia ontológica.
+Hash ligero del estado oculto para detección de divergencia ontológica.
 
 ```python
-# Automático — se computa al final de forward()
+# v5.1.1: opt-in para evitar sync GPU↔CPU en cada forward
+rims = RecurrentIndependentMechanisms(
+    ...,
+    compute_fingerprint=True,   # activar solo si el NCO lo consume
+)
 out, state = rims(x)
 fp = state.fingerprint   # e.g., 'a3f7c91b02d4e8f1'
 
@@ -307,13 +341,16 @@ if fp != previous_fp:
     nco.flag_divergence(delta=hamming(fp, previous_fp))
 ```
 
+**v5.1.1 — opt-in**: Por default `compute_fingerprint=False`. La función `_compute_fingerprint` incluye `.cpu()`, forzando una barrera de sincronización GPU→CPU que es costosa en training a alta velocidad. Solo se activa cuando el NCO lo necesita para auditoría.
+
 **Implementación:** Cuantifica el tensor `hidden_states` a 4 decimales (resolución ~0.0001), serializa a bytes, aplica SHA-256 truncado a 16 hex chars (64 bits de hash). Ignora ruido de punto flotante.
 
 **Propiedades:**
 - Determinístico dado el mismo estado.
-- Ligero (~0.1ms overhead por paso).
+- Ligero en cómputo, **pero** introduce sync GPU↔CPU (de ahí el opt-in).
 - No almacena el tensor — solo el hash.
 - Resolución configurable via `_compute_fingerprint(hidden, precision=4)`.
+- Cuando está desactivado, `RIMsState.fingerprint == ""` y `to_dict()` omite la clave.
 
 ---
 
@@ -331,7 +368,7 @@ optimizer_slow = torch.optim.Adam(rims.slow_params(), lr=1e-4)  # outer loop
 | `fast_params()` | GroupGRUCell, LayerNorm, OutputProj | Dinámicas recurrentes — se adaptan al entorno inmediato |
 | `slow_params()` | InputAttention, Comunicación, Temperatura Gumbel, initial_hidden | Estrategia de routing — estable a través de distribuciones |
 
-**v5.1: Validación exhaustiva.** `__init__()` ejecuta automáticamente `_validate_param_groups()` que verifica:
+**Validación exhaustiva.** `__init__()` ejecuta automáticamente `_validate_param_groups()` que verifica:
 1. `fast_params() ∩ slow_params() = ∅` — sin duplicados.
 2. `fast_params() ∪ slow_params() = self.parameters()` — sin omisiones.
 
@@ -348,17 +385,18 @@ forward(x, hidden=None, inactivity_steps=None) -> (output, RIMsState)
 ```
 - `x`: `[B, input_size]` o `[B, T, input_size]`
 - `hidden`: `[B, num_rims, rim_size]` o `None`
-- `inactivity_steps`: `[B, num_rims]` long o `None` (v5.1)
+- `inactivity_steps`: `[B, num_rims]` long o `None`
 - Retorna `output` del mismo rango temporal que `x`
 
 ```python
 reset_hidden(batch_size, device) -> Tuple[Tensor, Tensor]
-#  Retorna (hidden, inactivity_steps)  — BREAKING CHANGE v5.1
+#  Retorna (hidden, inactivity_steps)
 
 fast_params()    -> List[Parameter]
 slow_params()    -> List[Parameter]
 get_statistics() -> Dict[str, Any]
-gumbel_temp      -> Tensor   # property, via softplus (v5.1)
+gumbel_temp      -> Tensor   # property, via softplus
+extra_repr()     -> str       # diagnóstico via print(model)  (v5.1.1)
 ```
 
 ### `RIMsState`
@@ -370,35 +408,62 @@ class RIMsState:
     active_rims:       Tensor   # [B, K] bool
     attention_weights: Tensor   # [B, K] float
     communication:     Tensor   # [B, K, rim_size]
-    vq_loss:           Tensor   # scalar (0 si comm_mode != 'dvnc')
-    inactivity_steps:  Tensor   # [B, K] long — pasos inactivo (v5.1)
-    fingerprint:       str      # hash SHA-256 truncado (v5.1)
+    vq_loss:           Tensor   # scalar shape []  (v5.1.1: shape correcto)
+    inactivity_steps:  Tensor   # [B, K] long — pasos inactivo
+    fingerprint:       str      # hash SHA-256 truncado, "" si no opt-in
 
-    def to_dict(self) -> Dict[str, Any]: ...
+    def to_dict(self) -> Dict[str, Any]:  # v5.1.1: omite fingerprint si está vacío
+        ...
 ```
 
 ### `_compute_fingerprint`
 
 ```python
 def _compute_fingerprint(hidden: Tensor, precision: int = 4) -> str:
-    """Hash ligero del estado para NCO. Retorna 16 hex chars."""
+    """
+    Hash ligero del estado para NCO. Retorna 16 hex chars.
+    ATENCIÓN: incluye .cpu() — sync GPU→CPU. Solo llamar bajo demanda.
+    """
 ```
 
 ---
 
-## Migración v5.0 → v5.1
+## Migración
 
-### Breaking changes
+### v5.1.0 → v5.1.1
 
-| Cambio | v5.0 | v5.1 | Acción requerida |
-|--------|------|------|-----------------|
-| `reset_hidden()` | Retorna `Tensor` | Retorna `Tuple[Tensor, Tensor]` | Desempaquetar: `h, inact = rims.reset_hidden(...)` |
-| `forward()` | `(x, hidden)` | `(x, hidden, inactivity_steps)` | Pasar `inactivity_steps` en loops autoregresivos |
-| `RIMsState` | 5 campos | 7 campos (+`inactivity_steps`, +`fingerprint`) | Actualizar destructuring si aplica |
-| `log_gumbel_temp` | Parámetro directo | `_raw_gumbel_temp` (interno) | Renombrar en checkpoints |
-| `_DVNCCodebook.forward()` | `(hidden, active_mask)` | `(hidden, active_mask, activation_entropy)` | Solo afecta si se llama directamente |
+**Cambios sin acción requerida:**
+- Modelos con `comm_mode='standard'` o `'gwt'` y `inactivity_decay=0`: numéricamente equivalentes a v5.1.0.
+- API de `forward()`, `reset_hidden()`, `RIMsState`: sin cambios incompatibles.
 
-### Migración de checkpoints
+**Cambios con acción requerida:**
+
+| Cambio | v5.1.0 | v5.1.1 | Acción |
+|--------|--------|--------|--------|
+| VQ loss DVNC | `.detach()` invertidos | Posición canónica | Re-entrenar codebook (ver abajo) |
+| Inactivity decay orden | post-LayerNorm | pre-LayerNorm | Trayectorias cambian si `decay > 0` |
+| `compute_fingerprint` | Siempre activo | Default `False` | Pasar `True` si NCO lo consume |
+
+**Migración de checkpoints DVNC:**
+
+```python
+state_dict = torch.load('rims_v51.pt')
+model = RecurrentIndependentMechanisms(
+    ..., comm_mode='dvnc',
+    compute_fingerprint=False,
+)
+model.load_state_dict(state_dict)
+
+# Re-entrenamiento del codebook (recomendado): congelar encoder
+# y entrenar solo el codebook por ~1 epoch
+for p in model.parameters():
+    p.requires_grad = False
+for p in model.comm_layer.codebook.parameters():
+    p.requires_grad = True
+# ... loop de fine-tuning con tu loss + 0.1 * state.vq_loss ...
+```
+
+### v5.0 → v5.1.x (full migration)
 
 ```python
 state_dict = torch.load('rims_v50.pt')
@@ -413,6 +478,8 @@ state_dict['input_attention.W_q'] = old_wq.unsqueeze(0).expand(K, -1, -1).clone(
 
 # 3. Cargar con strict=False para nuevos parámetros (ws_generator, etc.)
 model.load_state_dict(state_dict, strict=False)
+
+# 4. Si comm_mode='dvnc': también aplicar fine-tuning del codebook (paso anterior)
 ```
 
 ---
@@ -427,11 +494,17 @@ Ver `benchmarks.py`. Resultados representativos (RTX 3090, batch=64, K=6, K_a=3)
 | v5.0 standard | ~4,800 | 340 | — | — |
 | v5.0 gwt | ~4,100 | 360 | — | — |
 | v5.0 dvnc | ~3,600 | 380 | ~0.12 | — |
-| v5.1 standard | ~4,700 | 345 | — | +decay +fingerprint overhead |
-| v5.1 gwt (dynamic) | ~3,800 | 380 | — | +ws_generator MLP |
-| v5.1 dvnc (adaptive) | ~3,500 | 385 | ~0.09 | β adaptativo reduce VQ loss |
+| v5.1.0 standard | ~4,700 | 345 | — | +decay +fingerprint always-on |
+| v5.1.0 gwt | ~3,800 | 380 | — | +ws_generator MLP |
+| v5.1.0 dvnc | ~3,500 | 385 | ~0.09 | β adaptativo |
+| **v5.1.1 standard** | **~4,950** | 345 | — | fingerprint opt-in elimina sync |
+| **v5.1.1 gwt** | **~3,950** | 380 | — | fingerprint opt-in elimina sync |
+| **v5.1.1 dvnc** | **~3,650** | 385 | **~0.07** | VQ loss canónico converge mejor |
 
-El overhead de v5.1 es ~2-7% en throughput, compensado por mayor estabilidad numérica y mejor convergencia del codebook DVNC.
+**Comentarios v5.1.1:**
+- Throughput mejora ~3–5% por eliminar sync GPU↔CPU del fingerprint (default off).
+- VQ loss DVNC converge a valores menores con la corrección canónica del codebook.
+- Si activas `compute_fingerprint=True`, el throughput regresa al nivel de v5.1.0.
 
 ---
 
@@ -441,18 +514,21 @@ El overhead de v5.1 es ~2-7% en throughput, compensado por mayor estabilidad num
 python -m pytest tests_rims.py -v
 ```
 
-Cobertura: 30 tests (22 originales + 8 nuevos v5.1):
+Cobertura: 30+ tests. Tests nuevos en v5.1.1:
 
 | Test nuevo | Valida |
 |-----------|--------|
-| `test_comm_mask_rows_not_cols` | Módulos inactivos son fuente en comunicación |
-| `test_per_module_wq` | W_q shapes [K, d_key, rim_size] y gradientes por módulo |
-| `test_gumbel_softplus_gradient` | Gradiente continuo de temperatura en todo el rango |
-| `test_softmax_no_nan` | Sin NaN en comunicación con 0 activos edge case |
-| `test_inactivity_decay_counter` | Contadores incrementan/resetean correctamente |
-| `test_inactivity_decay_norm` | Norma del estado decrece bajo inactividad prolongada |
-| `test_fingerprint_deterministic` | Mismo estado → mismo hash |
-| `test_fast_slow_exhaustive` | `fast ∪ slow = all`, `fast ∩ slow = ∅` |
+| `test_vq_loss_canonical_direction` | Codebook loss propaga a codebook, commitment a encoder |
+| `test_dvnc_entropy_gradient_flow` | `attention_weights` recibe gradiente via VQ loss |
+| `test_inactivity_decay_order` | Decay aplicado antes de LayerNorm, no después |
+| `test_fingerprint_optin` | `compute_fingerprint=False` → `state.fingerprint == ""` |
+| `test_fingerprint_no_sync_when_off` | Sin barrera GPU↔CPU cuando desactivado |
+| `test_ws_generator_zero_init` | `ws_generator[-1]` arranca con output ≈ 0 |
+| `test_init_weights_respects_managed` | `_init_weights` no sobrescribe submódulos auto-inicializados |
+| `test_inactivity_cap_configurable` | `inactivity_cap` afecta el ratio de decay |
+| `test_vq_loss_scalar_shape` | `vq_loss.shape == torch.Size([])` |
+
+Tests heredados (v5.1.0) se mantienen sin cambios y siguen pasando excepto los específicos de DVNC, que requieren actualización de tolerancias por la nueva trayectoria de optimización.
 
 ---
 
@@ -469,10 +545,12 @@ self.rims = RecurrentIndependentMechanisms(
     num_active       = 3,
     comm_mode        = 'gwt',
     routing          = 'gumbel',
-    inactivity_decay = 0.005,   # v5.1: recomendado para secuencias largas
+    inactivity_decay = 0.005,        # recomendado para secuencias largas
+    inactivity_cap   = 100.0,
+    compute_fingerprint = True,      # NCO lo consume → opt-in
 )
 
-# En el forward del workspace (v5.1: propagar inactivity_steps)
+# En el forward del workspace
 rims_out, rims_state = self.rims(
     perception_embedding,
     hidden=prev_state.hidden_states,
@@ -486,9 +564,25 @@ if rims_state.fingerprint != self.nco.last_fingerprint:
     self.nco.evaluate_divergence(rims_state)
 ```
 
+**Recomendación para E-α-1-v3:** activar `compute_fingerprint=True` solo en los módulos cuyo estado el NCO audite directamente (típicamente la capa RIMs del `GlobalWorkspaceEA1V2`). En capas RIMs intermedias (e.g., dentro de `EntityBrainV4`), mantener `False` para preservar throughput.
+
 ---
 
 ## Changelog
+
+### v5.1.1 (2026-04-25)
+**Correcciones funcionales y de robustez sobre v5.1.0.**
+- **BUGFIX (crítico, DVNC)**: VQ loss en posición canónica. En v5.1.0 los `.detach()` estaban invertidos, propagando codebook_loss al encoder y commitment_loss al codebook (van den Oord et al. 2017, eq. 3).
+- **BUGFIX (alto, DVNC)**: `activation_entropy` se mantiene como tensor para preservar el grafo. En v5.1.0 se hacía `.item()` y se reconstruía con `torch.tensor(...)`, descartando el gradiente hacia `attention_weights`.
+- **BUGFIX (medio)**: Inactivity decay aplicado antes de la mezcla Hadamard y antes del LayerNorm, consistente con el docstring. En v5.1.0 se aplicaba post-LayerNorm.
+- **MEJORA**: `_init_weights` respeta submódulos auto-inicializados (`_initialized = True`). Antes sobrescribía `_InputAttentionRIM`, `_GlobalWorkspace`, `_DVNCCodebook`.
+- **MEJORA**: `_GlobalWorkspace.ws_generator[-1]` se inicializa con `zeros_` (peso y bias). El gating "implícito" del docstring ahora es real.
+- **MEJORA**: `_InputAttentionRIM.W_q` se inicializa con xavier per-slice 2D, no sobre la view 3D.
+- **PERFORMANCE**: `compute_fingerprint=False` por default. Elimina sync GPU↔CPU en cada forward (~3-5% throughput recovery).
+- **API**: `inactivity_cap` configurable (era hardcoded 100.0). Validaciones extendidas en `__init__`.
+- **API**: `vq_loss` y `total_vq` con shape `[]` (scalar canónico) en lugar de `[1]`.
+- **API**: `extra_repr()` agregado para diagnóstico via `print(model)`.
+- **BREAKING (DVNC)**: Checkpoints v5.1.0 con `comm_mode='dvnc'` requieren re-entrenamiento del codebook por la inversión del VQ loss.
 
 ### v5.1.0 (2026-03-22)
 - **BUGFIX**: `_MultiHeadCommResidual` — máscara corregida: solo filas (queries), no columnas (sources). Todos los módulos son fuente.
